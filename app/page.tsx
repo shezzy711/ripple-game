@@ -75,6 +75,17 @@ const DECAY_MS = 600;
 const TAP_LIFE_MS = 650;
 const CRASH_INITIAL_COOLDOWN = 400;
 const CRASH_TRICKLE_COOLDOWN = 150;
+const BOND_THRESHOLD_MS = 5000;
+const BOND_LABEL_CYCLE_MS = 2800;
+const BOND_LABELS = [
+  "locked in",
+  "fused",
+  "+5000 aura",
+  "bonded",
+  "ripplemaxxing",
+  "clav maxxing",
+  "mogging together",
+];
 const CHANNEL = "ripple-room";
 
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
@@ -116,9 +127,11 @@ export default function Home() {
     lastSentY: number;
   } | null>(null);
 
-  // Crash
+  // Crash + bond
   const lastCrashAtRef = useRef<number>(0);
   const overlapActiveRef = useRef<boolean>(false);
+  const overlapStartedAtRef = useRef<number | null>(null);
+  const bondedRef = useRef<{ since: number; centerX: number; centerY: number } | null>(null);
 
   // Push + Pusher
   const channelRef = useRef<Channel | null>(null);
@@ -533,10 +546,21 @@ export default function Home() {
       return (0.08 + growth * 0.18) * minSide;
     };
 
+    const endBond = (fx: number, fy: number) => {
+      if (!bondedRef.current) return;
+      const bx = bondedRef.current.centerX || fx;
+      const by = bondedRef.current.centerY || fy;
+      spawnHearts(bx, by, 24);
+      vibrate([30, 50, 40, 60]);
+      bondedRef.current = null;
+    };
+
     const detectCrash = (now: number) => {
       const mine = myHoldRef.current;
       const theirs = theirHoldRef.current;
       if (!mine || !theirs) {
+        endBond(0, 0);
+        overlapStartedAtRef.current = null;
         overlapActiveRef.current = false;
         return;
       }
@@ -548,19 +572,36 @@ export default function Home() {
       const ty = theirs.y * H;
       const d = Math.hypot(mx - tx, my - ty);
       const rSum = heldRadius(mine, now) + heldRadius(theirs, now);
+      const cx = (mx + tx) / 2;
+      const cy = (my + ty) / 2;
+
       if (d < rSum * 0.9) {
-        const cx = (mx + tx) / 2;
-        const cy = (my + ty) / 2;
-        if (!overlapActiveRef.current && now - lastCrashAtRef.current > CRASH_INITIAL_COOLDOWN) {
-          spawnHearts(cx, cy, 12);
-          vibrate([20, 30, 40]);
-          overlapActiveRef.current = true;
-          lastCrashAtRef.current = now;
-        } else if (overlapActiveRef.current && now - lastCrashAtRef.current > CRASH_TRICKLE_COOLDOWN) {
-          spawnHearts(cx, cy, 1);
-          lastCrashAtRef.current = now;
+        if (overlapStartedAtRef.current == null) overlapStartedAtRef.current = now;
+        const overlapDur = now - overlapStartedAtRef.current;
+
+        if (overlapDur >= BOND_THRESHOLD_MS) {
+          if (!bondedRef.current) {
+            bondedRef.current = { since: now, centerX: cx, centerY: cy };
+            spawnHearts(cx, cy, 26);
+            vibrate([60, 80, 40, 80, 60]);
+          } else {
+            bondedRef.current.centerX = cx;
+            bondedRef.current.centerY = cy;
+          }
+        } else {
+          if (!overlapActiveRef.current && now - lastCrashAtRef.current > CRASH_INITIAL_COOLDOWN) {
+            spawnHearts(cx, cy, 12);
+            vibrate([20, 30, 40]);
+            overlapActiveRef.current = true;
+            lastCrashAtRef.current = now;
+          } else if (overlapActiveRef.current && now - lastCrashAtRef.current > CRASH_TRICKLE_COOLDOWN) {
+            spawnHearts(cx, cy, 1);
+            lastCrashAtRef.current = now;
+          }
         }
       } else {
+        endBond(cx, cy);
+        overlapStartedAtRef.current = null;
         overlapActiveRef.current = false;
       }
     };
@@ -608,22 +649,55 @@ export default function Home() {
         return true;
       });
 
-      // Their hold
+      const bonded = bondedRef.current;
       const theirs = theirHoldRef.current;
-      if (theirs) {
-        const cx = theirs.x * W;
-        const cy = theirs.y * H;
-        drawTrail(ctx, theirs, W, H, now);
-        drawHeldRipple(ctx, { x: cx, y: cy, r: heldRadius(theirs, now), user: theirs.user, alpha: 0.95, now });
-      }
-
-      // My hold
       const mine = myHoldRef.current;
-      if (mine) {
-        const cx = mine.x * W;
-        const cy = mine.y * H;
+
+      if (bonded && mine && theirs) {
+        // Dim the individual held ripples; the bond is the main event.
+        drawTrail(ctx, theirs, W, H, now);
         drawTrail(ctx, mine, W, H, now);
-        drawHeldRipple(ctx, { x: cx, y: cy, r: heldRadius(mine, now), user: mine.user, alpha: 1, now });
+        drawHeldRipple(ctx, {
+          x: theirs.x * W,
+          y: theirs.y * H,
+          r: heldRadius(theirs, now) * 0.85,
+          user: theirs.user,
+          alpha: 0.35,
+          now,
+        });
+        drawHeldRipple(ctx, {
+          x: mine.x * W,
+          y: mine.y * H,
+          r: heldRadius(mine, now) * 0.85,
+          user: mine.user,
+          alpha: 0.35,
+          now,
+        });
+
+        const bondedR =
+          Math.max(heldRadius(mine, now), heldRadius(theirs, now)) * 1.35 +
+          Math.min((now - bonded.since) / 60, 40);
+        drawBondedRipple(ctx, {
+          x: bonded.centerX,
+          y: bonded.centerY,
+          r: bondedR,
+          now,
+          since: bonded.since,
+        });
+        drawBondLabel(ctx, bonded, now, bondedR);
+      } else {
+        if (theirs) {
+          const cx = theirs.x * W;
+          const cy = theirs.y * H;
+          drawTrail(ctx, theirs, W, H, now);
+          drawHeldRipple(ctx, { x: cx, y: cy, r: heldRadius(theirs, now), user: theirs.user, alpha: 0.95, now });
+        }
+        if (mine) {
+          const cx = mine.x * W;
+          const cy = mine.y * H;
+          drawTrail(ctx, mine, W, H, now);
+          drawHeldRipple(ctx, { x: cx, y: cy, r: heldRadius(mine, now), user: mine.user, alpha: 1, now });
+        }
       }
 
       // Tap splashes
@@ -1045,6 +1119,118 @@ function drawStar(ctx: CanvasRenderingContext2D, x: number, y: number, size: num
   }
   ctx.closePath();
   ctx.fill();
+  ctx.restore();
+}
+
+function drawBondedRipple(
+  ctx: CanvasRenderingContext2D,
+  opts: { x: number; y: number; r: number; now: number; since: number }
+) {
+  const age = opts.now - opts.since;
+  const pulse = 1 + Math.sin(age * 0.006) * 0.12;
+  const R = opts.r * pulse;
+
+  // Outer warm halo
+  const halo = ctx.createRadialGradient(opts.x, opts.y, 0, opts.x, opts.y, R * 2);
+  halo.addColorStop(0, "rgba(255, 160, 210, 0.35)");
+  halo.addColorStop(0.45, "rgba(160, 120, 255, 0.18)");
+  halo.addColorStop(1, "rgba(0, 240, 255, 0)");
+  ctx.fillStyle = halo;
+  ctx.beginPath();
+  ctx.arc(opts.x, opts.y, R * 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Rotating conic body blending both palettes
+  const supportsConic = typeof (ctx as CanvasRenderingContext2D & {
+    createConicGradient?: (angle: number, x: number, y: number) => CanvasGradient;
+  }).createConicGradient === "function";
+  if (supportsConic) {
+    const conic = (ctx as CanvasRenderingContext2D & {
+      createConicGradient: (angle: number, x: number, y: number) => CanvasGradient;
+    }).createConicGradient(age * 0.002, opts.x, opts.y);
+    conic.addColorStop(0, "#00f0ff");
+    conic.addColorStop(0.2, "#a020ff");
+    conic.addColorStop(0.4, "#ff4fa8");
+    conic.addColorStop(0.6, "#ffb6c1");
+    conic.addColorStop(0.8, "#a020ff");
+    conic.addColorStop(1, "#00f0ff");
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = conic;
+    ctx.beginPath();
+    ctx.arc(opts.x, opts.y, R, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  } else {
+    const core = ctx.createRadialGradient(opts.x, opts.y, 0, opts.x, opts.y, R);
+    core.addColorStop(0, "rgba(255,120,200,0.6)");
+    core.addColorStop(0.6, "rgba(120,140,255,0.35)");
+    core.addColorStop(1, "rgba(0,240,255,0)");
+    ctx.fillStyle = core;
+    ctx.beginPath();
+    ctx.arc(opts.x, opts.y, R, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Bright core pulse
+  const corePulse = 0.5 + Math.sin(age * 0.008) * 0.2;
+  const coreR = R * 0.5 * corePulse;
+  const coreGrad = ctx.createRadialGradient(opts.x, opts.y, 0, opts.x, opts.y, coreR);
+  coreGrad.addColorStop(0, "rgba(255, 255, 255, 0.95)");
+  coreGrad.addColorStop(0.5, "rgba(255, 220, 240, 0.5)");
+  coreGrad.addColorStop(1, "rgba(255, 220, 240, 0)");
+  ctx.fillStyle = coreGrad;
+  ctx.beginPath();
+  ctx.arc(opts.x, opts.y, coreR, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Outgoing heartbeat rings
+  const phase = (age * 0.0009) % 1;
+  for (let i = 0; i < 3; i++) {
+    const t = (phase + i / 3) % 1;
+    const rr = R * (0.95 + t * 1.3);
+    const a = (1 - t) * 0.55;
+    ctx.strokeStyle = `rgba(255, 180, 220, ${a})`;
+    ctx.lineWidth = 2 + (1 - t) * 3;
+    ctx.beginPath();
+    ctx.arc(opts.x, opts.y, rr, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Counter-rotating orbital stars
+  const orbitR = R * 1.15;
+  for (let i = 0; i < 6; i++) {
+    const a = -age * 0.0011 + (i / 6) * Math.PI * 2;
+    const px = opts.x + Math.cos(a) * orbitR;
+    const py = opts.y + Math.sin(a) * orbitR;
+    drawStar(ctx, px, py, 3 + Math.sin(age * 0.004 + i) * 1.5, "rgba(255, 240, 245, 0.85)");
+  }
+}
+
+function drawBondLabel(
+  ctx: CanvasRenderingContext2D,
+  bond: { since: number; centerX: number; centerY: number },
+  now: number,
+  bondR: number
+) {
+  const bondAge = now - bond.since;
+  const idx = Math.floor(bondAge / BOND_LABEL_CYCLE_MS) % BOND_LABELS.length;
+  const label = BOND_LABELS[idx];
+  const phase = (bondAge % BOND_LABEL_CYCLE_MS) / BOND_LABEL_CYCLE_MS;
+  let alpha: number;
+  if (phase < 0.2) alpha = phase / 0.2;
+  else if (phase > 0.8) alpha = (1 - phase) / 0.2;
+  else alpha = 1;
+  alpha *= 0.5;
+  ctx.save();
+  ctx.globalCompositeOperation = "source-over";
+  ctx.font = "600 13px -apple-system, BlinkMacSystemFont, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.shadowColor = "rgba(0,0,0,0.6)";
+  ctx.shadowBlur = 6;
+  ctx.fillStyle = `rgba(255, 230, 240, ${alpha})`;
+  ctx.fillText(label, bond.centerX, bond.centerY + bondR + 28);
   ctx.restore();
 }
 
