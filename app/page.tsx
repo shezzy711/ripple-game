@@ -3,15 +3,14 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import Pusher, { Channel } from "pusher-js";
 
-type User = "shehzaad" | "maggie";
+// ============================================================
+// Types
+// ============================================================
 
-type Tap = {
-  id: string;
-  user: User;
-  x: number;
-  y: number;
-  bornAt: number; // local performance.now()
-};
+type User = "shehzaad" | "maggie";
+type Mode = "ripple" | "doodle";
+
+type Tap = { id: string; user: User; x: number; y: number; bornAt: number };
 
 type Hold = {
   id: string;
@@ -40,7 +39,37 @@ type Particle = {
   spin?: number;
 };
 
+type Stroke = {
+  id: string;
+  user: User;
+  points: Array<{ x: number; y: number }>;
+  endedAt: number | null;
+};
+
+type Bomb = { id: string; user: User; text: string; bornAt: number };
+
+type Star = {
+  id: string;
+  x: number;
+  y: number;
+  bornAt: number;
+  durationMs: number;
+  offset: number;
+};
+
+type Stats = {
+  totalTaps: number;
+  totalHolds: number;
+  totalCrashes: number;
+  totalBonds: number;
+  longestBondMs: number;
+};
+
 type PushSub = PushSubscriptionJSON;
+
+// ============================================================
+// Palette + constants
+// ============================================================
 
 const PALETTE = {
   shehzaad: {
@@ -77,6 +106,15 @@ const CRASH_INITIAL_COOLDOWN = 400;
 const CRASH_TRICKLE_COOLDOWN = 150;
 const BOND_THRESHOLD_MS = 5000;
 const BOND_LABEL_CYCLE_MS = 2800;
+const HEARTBEAT_INTERVAL_MS = 900;
+const STROKE_SEND_INTERVAL_MS = 80;
+const STROKE_FADE_MS = 4500;
+const BOMB_LIFE_MS = 4800;
+const PRESENCE_INTERVAL_MS = 20000;
+const PRESENCE_STALE_MS = 40000;
+const STAR_CAP = 500;
+const CHANNEL = "ripple-room";
+
 const BOND_LABELS = [
   "locked in",
   "fused",
@@ -86,7 +124,19 @@ const BOND_LABELS = [
   "clav maxxing",
   "mogging together",
 ];
-const CHANNEL = "ripple-room";
+
+const BOMB_PHRASES = [
+  "thinking of u",
+  "ur so fine",
+  "come closer",
+  "miss u",
+  "ur mogging",
+  "🫶",
+];
+
+// ============================================================
+// Utils
+// ============================================================
 
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 
@@ -99,29 +149,84 @@ function urlBase64ToUint8Array(base64String: string) {
   return output;
 }
 
+const DEFAULT_STATS: Stats = {
+  totalTaps: 0,
+  totalHolds: 0,
+  totalCrashes: 0,
+  totalBonds: 0,
+  longestBondMs: 0,
+};
+
+function loadStats(): Stats {
+  try {
+    const raw = localStorage.getItem("ripple-stats-v1");
+    if (!raw) return { ...DEFAULT_STATS };
+    return { ...DEFAULT_STATS, ...JSON.parse(raw) };
+  } catch {
+    return { ...DEFAULT_STATS };
+  }
+}
+function saveStats(s: Stats) {
+  try {
+    localStorage.setItem("ripple-stats-v1", JSON.stringify(s));
+  } catch {}
+}
+function loadStars(): Star[] {
+  try {
+    const raw = localStorage.getItem("ripple-stars-v1");
+    if (!raw) return [];
+    const arr = JSON.parse(raw) as Star[];
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+function saveStars(stars: Star[]) {
+  try {
+    const trimmed = stars.slice(-STAR_CAP);
+    localStorage.setItem("ripple-stars-v1", JSON.stringify(trimmed));
+  } catch {}
+}
+
+// ============================================================
+// Home component
+// ============================================================
+
 export default function Home() {
   const [user, setUser] = useState<User | null>(null);
   const [connected, setConnected] = useState(false);
   const [pushStatus, setPushStatus] = useState<"idle" | "pending" | "granted" | "denied" | "unsupported">("idle");
   const [isStandalone, setIsStandalone] = useState(false);
   const [showInstallHint, setShowInstallHint] = useState(false);
+  const [mode, setMode] = useState<Mode>("ripple");
+  const [soundOn, setSoundOn] = useState(false);
+  const [stats, setStats] = useState<Stats>(DEFAULT_STATS);
+  const [showStats, setShowStats] = useState(false);
+  const [showBombs, setShowBombs] = useState(false);
+  const [otherPresent, setOtherPresent] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const userRef = useRef<User | null>(null);
+  const modeRef = useRef<Mode>("ripple");
+  const soundOnRef = useRef<boolean>(false);
+  const statsRef = useRef<Stats>(DEFAULT_STATS);
 
+  // Interaction
   const myHoldRef = useRef<Hold | null>(null);
   const theirHoldRef = useRef<Hold | null>(null);
   const decayingHoldsRef = useRef<Hold[]>([]);
   const tapsRef = useRef<Tap[]>([]);
   const particlesRef = useRef<Particle[]>([]);
 
-  // Pointer session tracking
   const pointerSessionRef = useRef<{
     pointerId: number;
-    startedAt: number; // perf.now
+    startedAt: number;
     x: number;
     y: number;
-    holdId: string | null; // set when we cross the threshold
+    holdId: string | null;
+    strokeId: string | null;
+    strokeLastSendAt: number;
+    strokeBuffer: Array<{ x: number; y: number }>;
     lastSendAt: number;
     lastSentX: number;
     lastSentY: number;
@@ -132,6 +237,19 @@ export default function Home() {
   const overlapActiveRef = useRef<boolean>(false);
   const overlapStartedAtRef = useRef<number | null>(null);
   const bondedRef = useRef<{ since: number; centerX: number; centerY: number } | null>(null);
+  const lastHeartbeatAtRef = useRef<number>(0);
+
+  // Doodle strokes
+  const strokesRef = useRef<Map<string, Stroke>>(new Map());
+
+  // Bombs floating text
+  const bombsRef = useRef<Bomb[]>([]);
+
+  // Stars
+  const starsRef = useRef<Star[]>([]);
+
+  // Presence
+  const otherLastSeenRef = useRef<number>(0);
 
   // Push + Pusher
   const channelRef = useRef<Channel | null>(null);
@@ -140,25 +258,44 @@ export default function Home() {
   const lastSubBroadcastRef = useRef<number>(0);
   const lastPushSentRef = useRef<number>(0);
 
+  // Audio
+  const audioCtxRef = useRef<AudioContext | null>(null);
+
+  // ============================================================
+  // Init from localStorage
+  // ============================================================
   useEffect(() => {
-    const saved = (typeof window !== "undefined" && localStorage.getItem("ripple-user")) as User | null;
+    const saved = localStorage.getItem("ripple-user") as User | null;
     if (saved === "shehzaad" || saved === "maggie") setUser(saved);
     try {
       const s = localStorage.getItem("ripple-other-sub");
       if (s) otherSubRef.current = JSON.parse(s);
     } catch {}
-    if (typeof window !== "undefined") {
-      const standalone =
-        window.matchMedia("(display-mode: standalone)").matches ||
-        // @ts-expect-error iOS-specific
-        window.navigator.standalone === true;
-      setIsStandalone(standalone);
-    }
+    const savedMode = localStorage.getItem("ripple-mode") as Mode | null;
+    if (savedMode === "ripple" || savedMode === "doodle") setMode(savedMode);
+    setSoundOn(localStorage.getItem("ripple-sound") === "1");
+    const s = loadStats();
+    setStats(s);
+    statsRef.current = s;
+    starsRef.current = loadStars();
+    const standalone =
+      window.matchMedia("(display-mode: standalone)").matches ||
+      // @ts-expect-error iOS-specific
+      window.navigator.standalone === true;
+    setIsStandalone(standalone);
   }, []);
 
   useEffect(() => {
     userRef.current = user;
   }, [user]);
+  useEffect(() => {
+    modeRef.current = mode;
+    try { localStorage.setItem("ripple-mode", mode); } catch {}
+  }, [mode]);
+  useEffect(() => {
+    soundOnRef.current = soundOn;
+    try { localStorage.setItem("ripple-sound", soundOn ? "1" : "0"); } catch {}
+  }, [soundOn]);
 
   const choose = (u: User) => {
     localStorage.setItem("ripple-user", u);
@@ -169,7 +306,53 @@ export default function Home() {
     setUser(null);
   };
 
-  // Service worker
+  // ============================================================
+  // Audio
+  // ============================================================
+  const ensureAudio = useCallback(() => {
+    if (!soundOnRef.current) return null;
+    if (!audioCtxRef.current) {
+      try {
+        const Ctx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+        if (!Ctx) return null;
+        audioCtxRef.current = new Ctx();
+      } catch {
+        return null;
+      }
+    }
+    const ac = audioCtxRef.current;
+    if (ac && ac.state === "suspended") ac.resume().catch(() => {});
+    return ac;
+  }, []);
+
+  const playBlip = useCallback(
+    (freq: number, duration = 0.18, gain = 0.14, type: OscillatorType = "sine") => {
+      const ac = ensureAudio();
+      if (!ac) return;
+      const osc = ac.createOscillator();
+      const g = ac.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, ac.currentTime);
+      g.gain.setValueAtTime(0.0001, ac.currentTime);
+      g.gain.exponentialRampToValueAtTime(gain, ac.currentTime + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + duration);
+      osc.connect(g).connect(ac.destination);
+      osc.start();
+      osc.stop(ac.currentTime + duration + 0.02);
+    },
+    [ensureAudio]
+  );
+
+  const playFanfare = useCallback(() => {
+    const notes = [523, 659, 784, 988];
+    notes.forEach((f, i) => setTimeout(() => playBlip(f, 0.18, 0.12, "triangle"), i * 90));
+  }, [playBlip]);
+
+  // ============================================================
+  // Service worker + push
+  // ============================================================
   useEffect(() => {
     if (!user) return;
     if (typeof window === "undefined" || !("serviceWorker" in navigator)) {
@@ -235,7 +418,132 @@ export default function Home() {
     }).catch(() => {});
   }, []);
 
-  // Pusher
+  const sendPushMaybe = useCallback(async () => {
+    const sub = otherSubRef.current;
+    const me = userRef.current;
+    if (!sub || !me) return;
+    const now = Date.now();
+    if (now - lastPushSentRef.current < 60_000) return;
+    lastPushSentRef.current = now;
+    const pal = PALETTE[me];
+    const payload = {
+      title: `${pal.name}'s on ripple ${pal.pushEmoji}`,
+      body: "tap to ripple back",
+      tag: `ripple-${me}`,
+      url: "/",
+    };
+    try {
+      await fetch("/api/push", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ subscription: sub, payload }),
+      });
+    } catch {}
+  }, []);
+
+  // ============================================================
+  // Event senders
+  // ============================================================
+  const postTap = useCallback((tap: { id: string; user: User; x: number; y: number }) => {
+    fetch("/api/tap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(tap),
+    }).catch(() => {});
+  }, []);
+
+  const postHold = useCallback(
+    (payload: {
+      action: "start" | "move" | "end";
+      id: string;
+      user: User;
+      x?: number;
+      y?: number;
+    }) => {
+      fetch("/api/hold", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).catch(() => {});
+    },
+    []
+  );
+
+  const postEvent = useCallback((event: string, data: unknown) => {
+    fetch("/api/event", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ event, data }),
+    }).catch(() => {});
+  }, []);
+
+  // ============================================================
+  // Presence heartbeat
+  // ============================================================
+  useEffect(() => {
+    if (!user || !connected) return;
+    const beat = () => postEvent("presence", { user, at: Date.now() });
+    beat();
+    const id = setInterval(beat, PRESENCE_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [user, connected, postEvent]);
+
+  // Keep `otherPresent` state in sync (polls a ref that inbound events update)
+  useEffect(() => {
+    const id = setInterval(() => {
+      const fresh = Date.now() - otherLastSeenRef.current < PRESENCE_STALE_MS;
+      setOtherPresent(fresh);
+    }, 2000);
+    return () => clearInterval(id);
+  }, []);
+
+  // ============================================================
+  // Stats helpers
+  // ============================================================
+  const bumpStat = useCallback((key: keyof Stats, delta = 1) => {
+    const next = { ...statsRef.current, [key]: (statsRef.current[key] as number) + delta };
+    statsRef.current = next;
+    setStats(next);
+    saveStats(next);
+  }, []);
+
+  const recordBond = useCallback((durationMs: number) => {
+    const cur = statsRef.current;
+    const next: Stats = {
+      ...cur,
+      totalBonds: cur.totalBonds + 1,
+      longestBondMs: Math.max(cur.longestBondMs, durationMs),
+    };
+    statsRef.current = next;
+    setStats(next);
+    saveStats(next);
+  }, []);
+
+  const addStar = useCallback((star: Star) => {
+    if (starsRef.current.some((s) => s.id === star.id)) return;
+    starsRef.current = [...starsRef.current, star].slice(-STAR_CAP);
+    saveStars(starsRef.current);
+  }, []);
+
+  // ============================================================
+  // Love bomb
+  // ============================================================
+  const sendBomb = useCallback(
+    (text: string) => {
+      const me = userRef.current;
+      if (!me || !text.trim()) return;
+      const bomb: Bomb = { id: uid(), user: me, text: text.slice(0, 40), bornAt: performance.now() };
+      bombsRef.current.push(bomb);
+      postEvent("bomb", { id: bomb.id, user: me, text: bomb.text, at: Date.now() });
+      setShowBombs(false);
+      if (soundOnRef.current) playBlip(720, 0.2, 0.12, "triangle");
+    },
+    [postEvent, playBlip]
+  );
+
+  // ============================================================
+  // Pusher subscription
+  // ============================================================
   useEffect(() => {
     if (!user) return;
     const key = process.env.NEXT_PUBLIC_PUSHER_KEY;
@@ -244,6 +552,10 @@ export default function Home() {
     const pusher = new Pusher(key, { cluster });
     const channel = pusher.subscribe(CHANNEL);
     channelRef.current = channel;
+
+    const markSeen = (u?: User) => {
+      if (u && u !== userRef.current) otherLastSeenRef.current = Date.now();
+    };
 
     channel.bind("pusher:subscription_succeeded", () => {
       setConnected(true);
@@ -254,6 +566,7 @@ export default function Home() {
     });
 
     channel.bind("tap", (data: { id: string; user: User; x: number; y: number }) => {
+      markSeen(data.user);
       if (data.user === userRef.current) return;
       tapsRef.current.push({
         id: data.id,
@@ -273,6 +586,7 @@ export default function Home() {
         x?: number;
         y?: number;
       }) => {
+        markSeen(data.user);
         if (data.user === userRef.current) return;
         if (data.action === "start") {
           const now = performance.now();
@@ -306,12 +620,60 @@ export default function Home() {
     );
 
     channel.bind("push-sub", (data: { user: User; sub: PushSub }) => {
+      markSeen(data.user);
       if (data.user === userRef.current) return;
       otherSubRef.current = data.sub;
-      try {
-        localStorage.setItem("ripple-other-sub", JSON.stringify(data.sub));
-      } catch {}
+      try { localStorage.setItem("ripple-other-sub", JSON.stringify(data.sub)); } catch {}
       if (ownSubRef.current) broadcastOwnSub();
+    });
+
+    channel.bind("presence", (data: { user: User; at: number }) => {
+      markSeen(data.user);
+    });
+
+    channel.bind("bomb", (data: { id: string; user: User; text: string }) => {
+      markSeen(data.user);
+      if (data.user === userRef.current) return;
+      bombsRef.current.push({ id: data.id, user: data.user, text: data.text, bornAt: performance.now() });
+    });
+
+    channel.bind("star", (data: Star) => {
+      addStar(data);
+    });
+
+    channel.bind("stroke-start", (data: { id: string; user: User; x: number; y: number }) => {
+      markSeen(data.user);
+      if (data.user === userRef.current) return;
+      strokesRef.current.set(data.id, {
+        id: data.id,
+        user: data.user,
+        points: [{ x: data.x, y: data.y }],
+        endedAt: null,
+      });
+    });
+
+    channel.bind(
+      "stroke-points",
+      (data: { id: string; user: User; points: Array<{ x: number; y: number }> }) => {
+        markSeen(data.user);
+        if (data.user === userRef.current) return;
+        const s = strokesRef.current.get(data.id);
+        if (!s) return;
+        s.points.push(...data.points);
+      }
+    );
+
+    channel.bind("stroke-end", (data: { id: string; user: User }) => {
+      markSeen(data.user);
+      if (data.user === userRef.current) return;
+      const s = strokesRef.current.get(data.id);
+      if (!s) return;
+      s.endedAt = performance.now();
+    });
+
+    channel.bind("egg", (data: { user: User; bbox: { x: number; y: number; w: number; h: number }; kind: string }) => {
+      markSeen(data.user);
+      spawnHeartField(data.bbox);
     });
 
     return () => {
@@ -320,58 +682,12 @@ export default function Home() {
       pusher.disconnect();
       channelRef.current = null;
     };
-  }, [user, broadcastOwnSub]);
+  }, [user, broadcastOwnSub, addStar]);
 
-  // Push notification fire (local side)
-  const sendPushMaybe = useCallback(async () => {
-    const sub = otherSubRef.current;
-    const me = userRef.current;
-    if (!sub || !me) return;
-    const now = Date.now();
-    if (now - lastPushSentRef.current < 60_000) return;
-    lastPushSentRef.current = now;
-    const pal = PALETTE[me];
-    const payload = {
-      title: `${pal.name}'s on ripple ${pal.pushEmoji}`,
-      body: "tap to ripple back",
-      tag: `ripple-${me}`,
-      url: "/",
-    };
-    try {
-      await fetch("/api/push", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ subscription: sub, payload }),
-      });
-    } catch {}
-  }, []);
-
-  const postTap = useCallback((tap: { id: string; user: User; x: number; y: number }) => {
-    fetch("/api/tap", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(tap),
-    }).catch(() => {});
-  }, []);
-
-  const postHold = useCallback(
-    (payload: {
-      action: "start" | "move" | "end";
-      id: string;
-      user: User;
-      x?: number;
-      y?: number;
-    }) => {
-      fetch("/api/hold", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      }).catch(() => {});
-    },
-    []
-  );
-
-  const spawnHearts = (cx: number, cy: number, count: number) => {
+  // ============================================================
+  // Particle spawners
+  // ============================================================
+  const spawnHearts = useCallback((cx: number, cy: number, count: number) => {
     for (let i = 0; i < count; i++) {
       const angle = (i / count) * Math.PI * 2 + Math.random() * 0.4;
       const speed = 70 + Math.random() * 160;
@@ -390,9 +706,35 @@ export default function Home() {
         spin: (Math.random() - 0.5) * 2.5,
       });
     }
-  };
+  }, []);
 
+  const spawnHeartField = useCallback((bbox: { x: number; y: number; w: number; h: number }) => {
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+    const count = 30;
+    for (let i = 0; i < count; i++) {
+      const rx = bbox.x + Math.random() * bbox.w;
+      const ry = bbox.y + Math.random() * bbox.h;
+      particlesRef.current.push({
+        x: rx * W,
+        y: ry * H,
+        vx: (Math.random() - 0.5) * 80,
+        vy: -60 - Math.random() * 80,
+        life: 0,
+        max: 1600 + Math.random() * 800,
+        color: "#ff4fa8",
+        size: 10 + Math.random() * 14,
+        kind: "heart",
+        gravity: 50,
+        rot: Math.random() * Math.PI * 2,
+        spin: (Math.random() - 0.5) * 2.5,
+      });
+    }
+  }, []);
+
+  // ============================================================
   // Pointer + render
+  // ============================================================
   useEffect(() => {
     if (!user) return;
     const canvas = canvasRef.current;
@@ -413,9 +755,7 @@ export default function Home() {
 
     const vibrate = (pattern: number | number[]) => {
       if (typeof navigator !== "undefined" && "vibrate" in navigator) {
-        try {
-          navigator.vibrate(pattern);
-        } catch {}
+        try { navigator.vibrate(pattern); } catch {}
       }
     };
 
@@ -447,6 +787,8 @@ export default function Home() {
       };
       postHold({ action: "start", id, user: me, x: s.x, y: s.y });
       vibrate(12);
+      bumpStat("totalHolds");
+      if (soundOnRef.current) playBlip(260, 0.22, 0.1, "sine");
       sendPushMaybe();
     };
 
@@ -455,12 +797,44 @@ export default function Home() {
       canvas.setPointerCapture(e.pointerId);
       const { x, y } = getCoords(e);
       const now = performance.now();
+      const me = userRef.current;
+      if (!me) return;
+
+      if (modeRef.current === "doodle") {
+        const strokeId = uid();
+        pointerSessionRef.current = {
+          pointerId: e.pointerId,
+          startedAt: now,
+          x,
+          y,
+          holdId: null,
+          strokeId,
+          strokeLastSendAt: now,
+          strokeBuffer: [],
+          lastSendAt: 0,
+          lastSentX: x,
+          lastSentY: y,
+        };
+        strokesRef.current.set(strokeId, {
+          id: strokeId,
+          user: me,
+          points: [{ x, y }],
+          endedAt: null,
+        });
+        postEvent("stroke-start", { id: strokeId, user: me, x, y });
+        if (soundOnRef.current) playBlip(500, 0.08, 0.08);
+        return;
+      }
+
       pointerSessionRef.current = {
         pointerId: e.pointerId,
         startedAt: now,
         x,
         y,
         holdId: null,
+        strokeId: null,
+        strokeLastSendAt: 0,
+        strokeBuffer: [],
         lastSendAt: 0,
         lastSentX: x,
         lastSentY: y,
@@ -474,14 +848,28 @@ export default function Home() {
       s.x = x;
       s.y = y;
       const now = performance.now();
+      const me = userRef.current;
+      if (!me) return;
+
+      if (s.strokeId) {
+        // Doodle: accumulate points + throttled broadcast
+        const stroke = strokesRef.current.get(s.strokeId);
+        if (!stroke) return;
+        stroke.points.push({ x, y });
+        s.strokeBuffer.push({ x, y });
+        if (now - s.strokeLastSendAt >= STROKE_SEND_INTERVAL_MS && s.strokeBuffer.length > 0) {
+          postEvent("stroke-points", { id: s.strokeId, user: me, points: s.strokeBuffer });
+          s.strokeBuffer = [];
+          s.strokeLastSendAt = now;
+        }
+        return;
+      }
 
       if (!s.holdId) {
-        // Maybe promote if past threshold
         if (now - s.startedAt >= HOLD_THRESHOLD_MS) promoteToHold(now);
         return;
       }
 
-      // Active hold: update local and maybe broadcast
       const hold = myHoldRef.current;
       if (!hold || hold.id !== s.holdId) return;
       hold.x = x;
@@ -497,8 +885,32 @@ export default function Home() {
         s.lastSendAt = now;
         s.lastSentX = x;
         s.lastSentY = y;
-        postHold({ action: "move", id: s.holdId, user: userRef.current!, x, y });
+        postHold({ action: "move", id: s.holdId, user: me, x, y });
       }
+    };
+
+    const checkClosedLoop = (stroke: Stroke) => {
+      if (stroke.points.length < 15) return;
+      const first = stroke.points[0];
+      const last = stroke.points[stroke.points.length - 1];
+      const d = Math.hypot(first.x - last.x, first.y - last.y);
+      if (d > 0.08) return;
+      let minX = 1, minY = 1, maxX = 0, maxY = 0;
+      for (const p of stroke.points) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+      const w = maxX - minX;
+      const h = maxY - minY;
+      if (w * h < 0.01) return;
+      const bbox = { x: minX, y: minY, w, h };
+      spawnHeartField(bbox);
+      vibrate([40, 50, 60, 40, 80]);
+      if (soundOnRef.current) playFanfare();
+      const me = userRef.current;
+      if (me) postEvent("egg", { user: me, bbox, kind: "closed-loop" });
     };
 
     const finishSession = (e: PointerEvent) => {
@@ -509,16 +921,30 @@ export default function Home() {
       if (!me) return;
       const now = performance.now();
 
+      if (s.strokeId) {
+        // Flush buffer then end
+        if (s.strokeBuffer.length > 0) {
+          postEvent("stroke-points", { id: s.strokeId, user: me, points: s.strokeBuffer });
+        }
+        postEvent("stroke-end", { id: s.strokeId, user: me });
+        const stroke = strokesRef.current.get(s.strokeId);
+        if (stroke) {
+          stroke.endedAt = now;
+          checkClosedLoop(stroke);
+        }
+        return;
+      }
+
       if (!s.holdId) {
-        // It was a tap
         const tap: Tap = { id: uid(), user: me, x: s.x, y: s.y, bornAt: now };
         tapsRef.current.push(tap);
         postTap({ id: tap.id, user: me, x: s.x, y: s.y });
+        bumpStat("totalTaps");
+        if (soundOnRef.current) playBlip(700, 0.14, 0.1);
         sendPushMaybe();
         return;
       }
 
-      // Finish the hold: move to decaying
       const hold = myHoldRef.current;
       if (hold && hold.id === s.holdId) {
         hold.ending = true;
@@ -538,7 +964,6 @@ export default function Home() {
     canvas.addEventListener("pointercancel", onCancel);
     canvas.addEventListener("pointerleave", onCancel);
 
-    // Held ripple radius scales with hold age, capped
     const heldRadius = (hold: Hold, now: number) => {
       const age = Math.max(0, now - hold.startedAt);
       const growth = 1 - Math.pow(2, -age / 600);
@@ -546,12 +971,29 @@ export default function Home() {
       return (0.08 + growth * 0.18) * minSide;
     };
 
-    const endBond = (fx: number, fy: number) => {
+    const endBond = (fx: number, fy: number, now: number) => {
       if (!bondedRef.current) return;
-      const bx = bondedRef.current.centerX || fx;
-      const by = bondedRef.current.centerY || fy;
+      const bond = bondedRef.current;
+      const bx = bond.centerX || fx;
+      const by = bond.centerY || fy;
       spawnHearts(bx, by, 24);
       vibrate([30, 50, 40, 60]);
+      if (soundOnRef.current) playBlip(330, 0.25, 0.1, "sawtooth");
+      // Record bond stat
+      const bondDur = now - bond.since;
+      recordBond(bondDur + BOND_THRESHOLD_MS);
+      // Save star at center
+      const me = userRef.current;
+      const star: Star = {
+        id: uid(),
+        x: bx / window.innerWidth,
+        y: by / window.innerHeight,
+        bornAt: Date.now(),
+        durationMs: bondDur + BOND_THRESHOLD_MS,
+        offset: Math.random() * 10000,
+      };
+      addStar(star);
+      if (me) postEvent("star", star);
       bondedRef.current = null;
     };
 
@@ -559,7 +1001,7 @@ export default function Home() {
       const mine = myHoldRef.current;
       const theirs = theirHoldRef.current;
       if (!mine || !theirs) {
-        endBond(0, 0);
+        endBond(0, 0, now);
         overlapStartedAtRef.current = null;
         overlapActiveRef.current = false;
         return;
@@ -584,6 +1026,7 @@ export default function Home() {
             bondedRef.current = { since: now, centerX: cx, centerY: cy };
             spawnHearts(cx, cy, 26);
             vibrate([60, 80, 40, 80, 60]);
+            if (soundOnRef.current) playFanfare();
           } else {
             bondedRef.current.centerX = cx;
             bondedRef.current.centerY = cy;
@@ -594,13 +1037,15 @@ export default function Home() {
             vibrate([20, 30, 40]);
             overlapActiveRef.current = true;
             lastCrashAtRef.current = now;
+            bumpStat("totalCrashes");
+            if (soundOnRef.current) playBlip(820, 0.09, 0.12, "triangle");
           } else if (overlapActiveRef.current && now - lastCrashAtRef.current > CRASH_TRICKLE_COOLDOWN) {
             spawnHearts(cx, cy, 1);
             lastCrashAtRef.current = now;
           }
         }
       } else {
-        endBond(cx, cy);
+        endBond(cx, cy, now);
         overlapStartedAtRef.current = null;
         overlapActiveRef.current = false;
       }
@@ -626,9 +1071,22 @@ export default function Home() {
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, W, H);
 
+      // Constellation stars in the background
+      drawStars(ctx, starsRef.current, W, H, now);
+
       ctx.globalCompositeOperation = "lighter";
 
-      // Auto-decay stale remote hold (connection drop safety)
+      // Strokes (doodle layer)
+      const strokesToDelete: string[] = [];
+      strokesRef.current.forEach((stroke, id) => {
+        const fadeAge = stroke.endedAt != null ? now - stroke.endedAt : 0;
+        if (fadeAge > STROKE_FADE_MS) { strokesToDelete.push(id); return; }
+        const alpha = stroke.endedAt != null ? 1 - fadeAge / STROKE_FADE_MS : 1;
+        drawStroke(ctx, stroke, W, H, alpha);
+      });
+      strokesToDelete.forEach((id) => strokesRef.current.delete(id));
+
+      // Stale remote hold safety
       const staleTheirs = theirHoldRef.current;
       if (staleTheirs && now - staleTheirs.lastMoveAt > HOLD_STALE_MS) {
         staleTheirs.ending = true;
@@ -654,7 +1112,6 @@ export default function Home() {
       const mine = myHoldRef.current;
 
       if (bonded && mine && theirs) {
-        // Dim the individual held ripples; the bond is the main event.
         drawTrail(ctx, theirs, W, H, now);
         drawTrail(ctx, mine, W, H, now);
         drawHeldRipple(ctx, {
@@ -685,22 +1142,31 @@ export default function Home() {
           since: bonded.since,
         });
         drawBondLabel(ctx, bonded, now, bondedR);
+
+        // Heartbeat haptic + sound
+        if (now - lastHeartbeatAtRef.current > HEARTBEAT_INTERVAL_MS) {
+          vibrate([18, 50, 22]);
+          if (soundOnRef.current) playBlip(180, 0.1, 0.09, "sine");
+          lastHeartbeatAtRef.current = now;
+        }
       } else {
         if (theirs) {
-          const cx = theirs.x * W;
-          const cy = theirs.y * H;
           drawTrail(ctx, theirs, W, H, now);
-          drawHeldRipple(ctx, { x: cx, y: cy, r: heldRadius(theirs, now), user: theirs.user, alpha: 0.95, now });
+          drawHeldRipple(ctx, {
+            x: theirs.x * W,
+            y: theirs.y * H,
+            r: heldRadius(theirs, now),
+            user: theirs.user,
+            alpha: 0.95,
+            now,
+          });
         }
         if (mine) {
-          const cx = mine.x * W;
-          const cy = mine.y * H;
           drawTrail(ctx, mine, W, H, now);
-          drawHeldRipple(ctx, { x: cx, y: cy, r: heldRadius(mine, now), user: mine.user, alpha: 1, now });
+          drawHeldRipple(ctx, { x: mine.x * W, y: mine.y * H, r: heldRadius(mine, now), user: mine.user, alpha: 1, now });
         }
       }
 
-      // Tap splashes
       tapsRef.current = tapsRef.current.filter((t) => {
         const age = now - t.bornAt;
         if (age > TAP_LIFE_MS) return false;
@@ -711,18 +1177,13 @@ export default function Home() {
         return true;
       });
 
-      // Crash detection
       detectCrash(now);
 
-      // Particles
       const pArr = particlesRef.current;
       for (let i = pArr.length - 1; i >= 0; i--) {
         const p = pArr[i];
         p.life += dt;
-        if (p.life > p.max) {
-          pArr.splice(i, 1);
-          continue;
-        }
+        if (p.life > p.max) { pArr.splice(i, 1); continue; }
         if (p.gravity) p.vy += (p.gravity * dt) / 1000;
         p.x += (p.vx * dt) / 1000;
         p.y += (p.vy * dt) / 1000;
@@ -742,6 +1203,15 @@ export default function Home() {
       }
       ctx.globalAlpha = 1;
 
+      // Bombs (floating text)
+      ctx.globalCompositeOperation = "source-over";
+      bombsRef.current = bombsRef.current.filter((b) => {
+        const age = now - b.bornAt;
+        if (age > BOMB_LIFE_MS) return false;
+        drawBomb(ctx, b, W, H, age);
+        return true;
+      });
+
       rafId = requestAnimationFrame(draw);
     };
 
@@ -756,8 +1226,24 @@ export default function Home() {
       canvas.removeEventListener("pointercancel", onCancel);
       canvas.removeEventListener("pointerleave", onCancel);
     };
-  }, [user, postTap, postHold, sendPushMaybe]);
+  }, [
+    user,
+    postTap,
+    postHold,
+    postEvent,
+    sendPushMaybe,
+    bumpStat,
+    recordBond,
+    addStar,
+    spawnHearts,
+    spawnHeartField,
+    playBlip,
+    playFanfare,
+  ]);
 
+  // ============================================================
+  // Render
+  // ============================================================
   if (!user) {
     return (
       <main
@@ -799,11 +1285,13 @@ export default function Home() {
   }
 
   const pal = PALETTE[user];
+  const otherPal = PALETTE[user === "shehzaad" ? "maggie" : "shehzaad"];
 
   return (
     <main style={{ position: "relative", touchAction: "none" }}>
       <canvas ref={canvasRef} style={{ display: "block", width: "100vw", height: "100dvh", touchAction: "none" }} />
 
+      {/* Top-left: identity + presence */}
       <div
         style={{
           position: "fixed",
@@ -811,28 +1299,53 @@ export default function Home() {
           left: 16,
           display: "flex",
           alignItems: "center",
-          gap: 10,
-          background: "rgba(0,0,0,0.4)",
-          backdropFilter: "blur(8px)",
-          padding: "8px 14px",
-          borderRadius: 999,
-          fontSize: 14,
-          fontWeight: 600,
+          gap: 8,
           pointerEvents: "none",
         }}
       >
-        <span
+        <div
           style={{
-            width: 10,
-            height: 10,
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            background: "rgba(0,0,0,0.4)",
+            backdropFilter: "blur(8px)",
+            padding: "8px 14px",
             borderRadius: 999,
-            background: connected ? "#00ff88" : "#ff4040",
-            boxShadow: connected ? "0 0 10px #00ff88" : "0 0 8px #ff4040",
+            fontSize: 14,
+            fontWeight: 600,
           }}
-        />
-        <span style={{ opacity: 0.9 }}>{pal.name}</span>
+        >
+          <span
+            style={{
+              width: 10,
+              height: 10,
+              borderRadius: 999,
+              background: connected ? "#00ff88" : "#ff4040",
+              boxShadow: connected ? "0 0 10px #00ff88" : "0 0 8px #ff4040",
+            }}
+          />
+          <span style={{ opacity: 0.9 }}>{pal.name}</span>
+        </div>
+        {otherPresent && (
+          <div
+            style={{
+              background: `rgba(${otherPal.primary.join(",")},0.18)`,
+              border: `1px solid rgba(${otherPal.primary.join(",")},0.55)`,
+              padding: "6px 12px",
+              borderRadius: 999,
+              fontSize: 12,
+              fontWeight: 600,
+              color: "#fff",
+              boxShadow: `0 0 14px rgba(${otherPal.primary.join(",")},0.35)`,
+            }}
+          >
+            w/ {otherPal.name.toLowerCase()} ✨
+          </div>
+        )}
       </div>
 
+      {/* Top-right: sound / mode / pings / switch */}
       <div
         style={{
           position: "fixed",
@@ -841,8 +1354,40 @@ export default function Home() {
           display: "flex",
           gap: 8,
           alignItems: "center",
+          flexWrap: "wrap",
+          justifyContent: "flex-end",
+          maxWidth: "70vw",
         }}
       >
+        {/* Mode segmented */}
+        <div
+          style={{
+            display: "flex",
+            background: "rgba(0,0,0,0.4)",
+            backdropFilter: "blur(8px)",
+            borderRadius: 999,
+            padding: 3,
+            gap: 2,
+          }}
+        >
+          <button
+            onClick={() => setMode("ripple")}
+            style={segBtn(mode === "ripple", pal.buttonBg)}
+            aria-label="ripple mode"
+          >
+            🌊
+          </button>
+          <button
+            onClick={() => setMode("doodle")}
+            style={segBtn(mode === "doodle", pal.buttonBg)}
+            aria-label="doodle mode"
+          >
+            ✎
+          </button>
+        </div>
+        <button onClick={() => setSoundOn((v) => !v)} style={iconBtn()} aria-label="sound">
+          {soundOn ? "🔊" : "🔇"}
+        </button>
         {pushStatus !== "granted" && pushStatus !== "unsupported" && (
           <button
             onClick={enablePush}
@@ -850,7 +1395,7 @@ export default function Home() {
               background: pal.buttonBg,
               color: "#fff",
               border: "none",
-              padding: "8px 14px",
+              padding: "8px 12px",
               borderRadius: 999,
               fontSize: 13,
               fontWeight: 700,
@@ -858,65 +1403,216 @@ export default function Home() {
               boxShadow: "0 4px 18px rgba(0,0,0,0.4)",
             }}
           >
-            🔔 pings
+            🔔
           </button>
         )}
-        {pushStatus === "granted" && (
-          <div
-            style={{
-              background: "rgba(0,0,0,0.4)",
-              backdropFilter: "blur(8px)",
-              color: "#fff",
-              padding: "8px 14px",
-              borderRadius: 999,
-              fontSize: 13,
-              fontWeight: 600,
-              opacity: 0.85,
-            }}
-          >
-            🔔 on
-          </div>
-        )}
-        <button
-          onClick={resetUser}
-          style={{
-            background: "rgba(0,0,0,0.4)",
-            backdropFilter: "blur(8px)",
-            color: "#fff",
-            border: "none",
-            padding: "8px 14px",
-            borderRadius: 999,
-            fontSize: 13,
-            fontWeight: 500,
-            opacity: 0.7,
-            cursor: "pointer",
-          }}
-        >
-          switch
+        {pushStatus === "granted" && <div style={iconBtn()}>🔔</div>}
+        <button onClick={resetUser} style={iconBtn()} aria-label="switch user">
+          ⟳
         </button>
       </div>
 
-      <div
+      {/* Bottom-left: stats */}
+      <button
+        onClick={() => setShowStats(true)}
         style={{
           position: "fixed",
           bottom: "max(20px, calc(env(safe-area-inset-bottom) + 20px))",
+          left: 16,
+          background: "rgba(0,0,0,0.4)",
+          backdropFilter: "blur(8px)",
+          color: "#fff",
+          border: "none",
+          padding: "8px 14px",
+          borderRadius: 999,
+          fontSize: 12,
+          fontWeight: 600,
+          opacity: 0.75,
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+        }}
+      >
+        💫 {stats.totalBonds}
+      </button>
+
+      {/* Bottom-right: love bomb */}
+      <button
+        onClick={() => setShowBombs(true)}
+        style={{
+          position: "fixed",
+          bottom: "max(20px, calc(env(safe-area-inset-bottom) + 20px))",
+          right: 16,
+          background: "rgba(0,0,0,0.4)",
+          backdropFilter: "blur(8px)",
+          color: "#fff",
+          border: "none",
+          padding: "8px 14px",
+          borderRadius: 999,
+          fontSize: 14,
+          fontWeight: 700,
+          cursor: "pointer",
+          opacity: 0.9,
+        }}
+      >
+        💌
+      </button>
+
+      {/* Hint */}
+      <div
+        style={{
+          position: "fixed",
+          bottom: "max(56px, calc(env(safe-area-inset-bottom) + 56px))",
           left: 0,
           right: 0,
           textAlign: "center",
-          fontSize: 12,
-          opacity: 0.4,
+          fontSize: 11,
+          opacity: 0.35,
           pointerEvents: "none",
         }}
       >
-        tap · hold to drag · crash into theirs
+        {mode === "ripple"
+          ? "tap · hold to drag · crash · hold together for 5s to bond"
+          : "drag to doodle · close the loop for a surprise"}
       </div>
 
+      {/* Stats overlay */}
+      {showStats && (
+        <div
+          onClick={() => setShowStats(false)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.75)",
+            backdropFilter: "blur(10px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 24,
+            zIndex: 20,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "#111",
+              border: "1px solid rgba(255,255,255,0.1)",
+              padding: 24,
+              borderRadius: 20,
+              maxWidth: 340,
+              width: "100%",
+            }}
+          >
+            <h3 style={{ fontSize: 20, fontWeight: 800, marginBottom: 16, textAlign: "center" }}>
+              lifetime stats
+            </h3>
+            <StatRow label="bonds" value={stats.totalBonds.toLocaleString()} />
+            <StatRow label="longest bond" value={formatDuration(stats.longestBondMs)} />
+            <StatRow label="crashes" value={stats.totalCrashes.toLocaleString()} />
+            <StatRow label="holds" value={stats.totalHolds.toLocaleString()} />
+            <StatRow label="taps" value={stats.totalTaps.toLocaleString()} />
+            <StatRow label="stars saved" value={starsRef.current.length.toLocaleString()} />
+            <button
+              onClick={() => setShowStats(false)}
+              style={{
+                marginTop: 18,
+                width: "100%",
+                background: pal.buttonBg,
+                color: "#fff",
+                border: "none",
+                padding: "12px 18px",
+                borderRadius: 14,
+                fontSize: 15,
+                fontWeight: 700,
+                cursor: "pointer",
+              }}
+            >
+              close
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Bombs drawer */}
+      {showBombs && (
+        <div
+          onClick={() => setShowBombs(false)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.6)",
+            backdropFilter: "blur(6px)",
+            display: "flex",
+            alignItems: "flex-end",
+            justifyContent: "center",
+            padding: 0,
+            zIndex: 20,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "#111",
+              borderTopLeftRadius: 24,
+              borderTopRightRadius: 24,
+              border: "1px solid rgba(255,255,255,0.1)",
+              padding: 20,
+              width: "100%",
+              maxWidth: 520,
+            }}
+          >
+            <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 12, opacity: 0.7, textAlign: "center" }}>
+              send a love bomb
+            </h3>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              {BOMB_PHRASES.map((p) => (
+                <button
+                  key={p}
+                  onClick={() => sendBomb(p)}
+                  style={{
+                    background: `linear-gradient(135deg, rgba(${otherPal.primary.join(",")},0.25), rgba(${otherPal.primary.join(",")},0.1))`,
+                    border: `1px solid rgba(${otherPal.primary.join(",")},0.4)`,
+                    color: "#fff",
+                    padding: "14px 10px",
+                    borderRadius: 14,
+                    fontSize: 14,
+                    fontWeight: 600,
+                    cursor: "pointer",
+                  }}
+                >
+                  {p}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => setShowBombs(false)}
+              style={{
+                marginTop: 14,
+                width: "100%",
+                background: "rgba(255,255,255,0.08)",
+                color: "#fff",
+                border: "none",
+                padding: "10px 14px",
+                borderRadius: 12,
+                fontSize: 13,
+                fontWeight: 500,
+                cursor: "pointer",
+              }}
+            >
+              close
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Install hint */}
       {!isStandalone && pushStatus !== "granted" && !showInstallHint && (
         <button
           onClick={() => setShowInstallHint(true)}
           style={{
             position: "fixed",
-            bottom: "max(50px, calc(env(safe-area-inset-bottom) + 50px))",
+            bottom: "max(88px, calc(env(safe-area-inset-bottom) + 88px))",
             left: "50%",
             transform: "translateX(-50%)",
             background: "rgba(255,255,255,0.1)",
@@ -928,10 +1624,9 @@ export default function Home() {
             fontWeight: 500,
             opacity: 0.65,
             cursor: "pointer",
-            pointerEvents: "auto",
           }}
         >
-          📱 how to enable pings
+          📱 enable pings
         </button>
       )}
       {showInstallHint && (
@@ -947,7 +1642,7 @@ export default function Home() {
             alignItems: "center",
             justifyContent: "center",
             padding: 24,
-            zIndex: 10,
+            zIndex: 30,
           }}
         >
           <div
@@ -974,7 +1669,7 @@ export default function Home() {
             </h3>
             <p style={{ fontSize: 14, opacity: 0.8, lineHeight: 1.5, marginBottom: 16 }}>
               tap <strong>Share</strong> → <strong>Add to Home Screen</strong>. open the ripple app from there → tap 🔔
-              pings → allow notifications. now you&apos;ll get pinged when the other is rippling.
+              → allow notifications.
             </p>
             <p style={{ fontSize: 12, opacity: 0.5 }}>tap anywhere to close</p>
           </div>
@@ -983,6 +1678,10 @@ export default function Home() {
     </main>
   );
 }
+
+// ============================================================
+// UI helpers
+// ============================================================
 
 function btnStyle(bg: string): React.CSSProperties {
   return {
@@ -999,6 +1698,66 @@ function btnStyle(bg: string): React.CSSProperties {
   };
 }
 
+function iconBtn(): React.CSSProperties {
+  return {
+    background: "rgba(0,0,0,0.4)",
+    backdropFilter: "blur(8px)",
+    color: "#fff",
+    border: "none",
+    padding: "8px 12px",
+    borderRadius: 999,
+    fontSize: 15,
+    fontWeight: 500,
+    cursor: "pointer",
+    minWidth: 38,
+    textAlign: "center",
+  };
+}
+
+function segBtn(active: boolean, bg: string): React.CSSProperties {
+  return {
+    background: active ? bg : "transparent",
+    color: "#fff",
+    border: "none",
+    padding: "6px 12px",
+    borderRadius: 999,
+    fontSize: 15,
+    fontWeight: 600,
+    cursor: "pointer",
+    opacity: active ? 1 : 0.55,
+  };
+}
+
+function StatRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        padding: "10px 0",
+        borderBottom: "1px solid rgba(255,255,255,0.08)",
+        fontSize: 14,
+      }}
+    >
+      <span style={{ opacity: 0.6 }}>{label}</span>
+      <span style={{ fontWeight: 700 }}>{value}</span>
+    </div>
+  );
+}
+
+function formatDuration(ms: number) {
+  if (ms <= 0) return "—";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${s % 60}s`;
+}
+
+// ============================================================
+// Drawing helpers
+// ============================================================
+
 function drawHeldRipple(
   ctx: CanvasRenderingContext2D,
   opts: { x: number; y: number; r: number; user: User; alpha: number; now: number }
@@ -1008,7 +1767,6 @@ function drawHeldRipple(
   const [sr, sg, sb] = pal.secondary;
   const a = opts.alpha;
 
-  // Core gradient disc
   const core = ctx.createRadialGradient(opts.x, opts.y, 0, opts.x, opts.y, opts.r);
   core.addColorStop(0, `rgba(${sr},${sg},${sb},${a * 0.7})`);
   core.addColorStop(0.45, `rgba(${pr},${pg},${pb},${a * 0.4})`);
@@ -1018,7 +1776,6 @@ function drawHeldRipple(
   ctx.arc(opts.x, opts.y, opts.r, 0, Math.PI * 2);
   ctx.fill();
 
-  // Continuously emitted sonar rings (3 at different phases)
   const phase = opts.now * 0.001;
   for (let i = 0; i < 3; i++) {
     const t = (phase + i / 3) % 1;
@@ -1031,7 +1788,6 @@ function drawHeldRipple(
     ctx.stroke();
   }
 
-  // Per-user flourish (lightning / sparkles)
   if (pal.vibe === "epic") {
     const arcs = 3;
     for (let i = 0; i < arcs; i++) {
@@ -1094,7 +1850,6 @@ function drawSplash(
   ctx.beginPath();
   ctx.arc(opts.x, opts.y, opts.r, 0, Math.PI * 2);
   ctx.stroke();
-
   const core = ctx.createRadialGradient(opts.x, opts.y, 0, opts.x, opts.y, opts.r * 0.8);
   core.addColorStop(0, `rgba(${pr},${pg},${pb},${opts.alpha * 0.4})`);
   core.addColorStop(1, `rgba(${pr},${pg},${pb},0)`);
@@ -1122,6 +1877,121 @@ function drawStar(ctx: CanvasRenderingContext2D, x: number, y: number, size: num
   ctx.restore();
 }
 
+function drawHeart(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  size: number,
+  color: string,
+  rot: number
+) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(rot);
+  ctx.scale(size / 20, size / 20);
+  ctx.fillStyle = color;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 12;
+  ctx.beginPath();
+  ctx.moveTo(0, 6);
+  ctx.bezierCurveTo(-10, -4, -14, 2, 0, 14);
+  ctx.bezierCurveTo(14, 2, 10, -4, 0, 6);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawStars(
+  ctx: CanvasRenderingContext2D,
+  stars: Star[],
+  W: number,
+  H: number,
+  now: number
+) {
+  if (stars.length === 0) return;
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  for (const star of stars) {
+    const twinkle = 0.6 + Math.sin((now + star.offset) * 0.0022) * 0.4;
+    const alpha = 0.25 + twinkle * 0.25;
+    const size = 1.2 + twinkle * 1.3 + Math.min(star.durationMs, 30000) / 30000;
+    const x = star.x * W;
+    const y = star.y * H;
+    const glow = ctx.createRadialGradient(x, y, 0, x, y, size * 4);
+    glow.addColorStop(0, `rgba(255, 220, 240, ${alpha})`);
+    glow.addColorStop(0.4, `rgba(255, 180, 220, ${alpha * 0.4})`);
+    glow.addColorStop(1, "rgba(255, 180, 220, 0)");
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(x, y, size * 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = `rgba(255, 245, 240, ${Math.min(1, alpha + 0.3)})`;
+    ctx.beginPath();
+    ctx.arc(x, y, size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawStroke(
+  ctx: CanvasRenderingContext2D,
+  stroke: Stroke,
+  W: number,
+  H: number,
+  alpha: number
+) {
+  const pts = stroke.points;
+  if (pts.length < 2) return;
+  const pal = PALETTE[stroke.user];
+  const [pr, pg, pb] = pal.primary;
+  ctx.save();
+  ctx.strokeStyle = `rgba(${pr},${pg},${pb},${alpha})`;
+  ctx.lineWidth = 3.5;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.shadowColor = `rgba(${pr},${pg},${pb},${Math.min(1, alpha)})`;
+  ctx.shadowBlur = 10;
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x * W, pts[0].y * H);
+  for (let i = 1; i < pts.length - 1; i++) {
+    const xc = ((pts[i].x + pts[i + 1].x) / 2) * W;
+    const yc = ((pts[i].y + pts[i + 1].y) / 2) * H;
+    ctx.quadraticCurveTo(pts[i].x * W, pts[i].y * H, xc, yc);
+  }
+  const last = pts[pts.length - 1];
+  ctx.lineTo(last.x * W, last.y * H);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawBomb(
+  ctx: CanvasRenderingContext2D,
+  b: Bomb,
+  W: number,
+  H: number,
+  age: number
+) {
+  const p = age / BOMB_LIFE_MS;
+  const rise = 1 - Math.pow(1 - p, 2);
+  const y = H * (0.82 - rise * 0.55);
+  const pal = PALETTE[b.user];
+  const scale = 0.85 + Math.sin(p * Math.PI) * 0.2;
+  let alpha = 1;
+  if (p < 0.15) alpha = p / 0.15;
+  else if (p > 0.75) alpha = (1 - p) / 0.25;
+  const fontSize = 30 * scale;
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = `800 ${fontSize}px -apple-system, sans-serif`;
+  const [pr, pg, pb] = pal.primary;
+  ctx.shadowColor = `rgba(${pr},${pg},${pb},${alpha * 0.9})`;
+  ctx.shadowBlur = 22;
+  ctx.fillStyle = `rgba(255,245,250,${alpha})`;
+  ctx.fillText(b.text, W / 2, y);
+  ctx.restore();
+}
+
 function drawBondedRipple(
   ctx: CanvasRenderingContext2D,
   opts: { x: number; y: number; r: number; now: number; since: number }
@@ -1130,7 +2000,6 @@ function drawBondedRipple(
   const pulse = 1 + Math.sin(age * 0.006) * 0.12;
   const R = opts.r * pulse;
 
-  // Outer warm halo
   const halo = ctx.createRadialGradient(opts.x, opts.y, 0, opts.x, opts.y, R * 2);
   halo.addColorStop(0, "rgba(255, 160, 210, 0.35)");
   halo.addColorStop(0.45, "rgba(160, 120, 255, 0.18)");
@@ -1140,14 +2009,17 @@ function drawBondedRipple(
   ctx.arc(opts.x, opts.y, R * 2, 0, Math.PI * 2);
   ctx.fill();
 
-  // Rotating conic body blending both palettes
-  const supportsConic = typeof (ctx as CanvasRenderingContext2D & {
-    createConicGradient?: (angle: number, x: number, y: number) => CanvasGradient;
-  }).createConicGradient === "function";
+  const supportsConic = typeof (
+    ctx as CanvasRenderingContext2D & {
+      createConicGradient?: (angle: number, x: number, y: number) => CanvasGradient;
+    }
+  ).createConicGradient === "function";
   if (supportsConic) {
-    const conic = (ctx as CanvasRenderingContext2D & {
-      createConicGradient: (angle: number, x: number, y: number) => CanvasGradient;
-    }).createConicGradient(age * 0.002, opts.x, opts.y);
+    const conic = (
+      ctx as CanvasRenderingContext2D & {
+        createConicGradient: (angle: number, x: number, y: number) => CanvasGradient;
+      }
+    ).createConicGradient(age * 0.002, opts.x, opts.y);
     conic.addColorStop(0, "#00f0ff");
     conic.addColorStop(0.2, "#a020ff");
     conic.addColorStop(0.4, "#ff4fa8");
@@ -1172,7 +2044,6 @@ function drawBondedRipple(
     ctx.fill();
   }
 
-  // Bright core pulse
   const corePulse = 0.5 + Math.sin(age * 0.008) * 0.2;
   const coreR = R * 0.5 * corePulse;
   const coreGrad = ctx.createRadialGradient(opts.x, opts.y, 0, opts.x, opts.y, coreR);
@@ -1184,7 +2055,6 @@ function drawBondedRipple(
   ctx.arc(opts.x, opts.y, coreR, 0, Math.PI * 2);
   ctx.fill();
 
-  // Outgoing heartbeat rings
   const phase = (age * 0.0009) % 1;
   for (let i = 0; i < 3; i++) {
     const t = (phase + i / 3) % 1;
@@ -1197,7 +2067,6 @@ function drawBondedRipple(
     ctx.stroke();
   }
 
-  // Counter-rotating orbital stars
   const orbitR = R * 1.15;
   for (let i = 0; i < 6; i++) {
     const a = -age * 0.0011 + (i / 6) * Math.PI * 2;
@@ -1231,29 +2100,5 @@ function drawBondLabel(
   ctx.shadowBlur = 6;
   ctx.fillStyle = `rgba(255, 230, 240, ${alpha})`;
   ctx.fillText(label, bond.centerX, bond.centerY + bondR + 28);
-  ctx.restore();
-}
-
-function drawHeart(
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  size: number,
-  color: string,
-  rot: number
-) {
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.rotate(rot);
-  ctx.scale(size / 20, size / 20);
-  ctx.fillStyle = color;
-  ctx.shadowColor = color;
-  ctx.shadowBlur = 12;
-  ctx.beginPath();
-  ctx.moveTo(0, 6);
-  ctx.bezierCurveTo(-10, -4, -14, 2, 0, 14);
-  ctx.bezierCurveTo(14, 2, 10, -4, 0, 6);
-  ctx.closePath();
-  ctx.fill();
   ctx.restore();
 }
