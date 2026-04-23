@@ -33,10 +33,11 @@ type Particle = {
   max: number;
   color: string;
   size: number;
-  kind: "heart" | "spark";
+  kind: "heart" | "spark" | "sparkle-rise" | "petal" | "star-streak" | "firework";
   gravity?: number;
   rot?: number;
   spin?: number;
+  sway?: number;
 };
 
 type Stroke = {
@@ -124,7 +125,110 @@ const BOND_LABELS = [
   "ripplemaxxing",
   "clav maxxing",
   "mogging together",
+  "inseparable",
+  "core memory",
+  "pair-bonded",
+  "aurafusion",
+  "linked up",
+  "same wavelength",
+  "my person",
+  "main character",
+  "built different",
+  "it's giving bond",
+  "+10k aura",
+  "+25k aura",
+  "gigafused",
+  "canon event",
+  "sigma coded",
+  "twin flame",
+  "meant to be",
+  "we locked",
+  "never letting go",
+  "sealed",
+  "infinity",
+  "delulu fr",
+  "no thoughts just u",
+  "brainrotten together",
+  "unit",
+  "ur my w",
+  "i see u",
+  "im here",
+  "u got me",
+  "ur safe",
+  "we good",
+  "real ones",
+  "the one",
+  "endgame",
+  "forever",
+  "∞",
+  "mine",
+  "urs",
+  "us",
+  "soft-locked",
+  "hard-mogged",
+  "PSL together: 10",
+  "hunter eyes sync",
+  "bond arc",
+  "stacey & sigma",
+  "synced",
+  "on frequency",
+  "mewing sync",
+  "aura farming",
+  "u rizzed me",
+  "we're him",
+  "we're her",
+  "gigabonded",
+  "10/10 bond",
+  "ur so me",
+  "twin paired",
+  "locked tf in",
+  "gravity",
+  "canon",
+  "mogged by love",
 ];
+
+const BOND_MILESTONES: Array<{ atMs: number; label: string; kind: "stage" | "milestone" }> = [
+  { atMs: 10_000, kind: "stage", label: "warming up ✨" },
+  { atMs: 15_000, kind: "milestone", label: "15s fused" },
+  { atMs: 25_000, kind: "stage", label: "aura rising" },
+  { atMs: 30_000, kind: "milestone", label: "30s strong" },
+  { atMs: 45_000, kind: "milestone", label: "+10k aura" },
+  { atMs: 50_000, kind: "stage", label: "love rings unlocked" },
+  { atMs: 60_000, kind: "milestone", label: "1 min bond" },
+  { atMs: 75_000, kind: "milestone", label: "still locked in" },
+  { atMs: 90_000, kind: "stage", label: "edges of the world" },
+  { atMs: 120_000, kind: "milestone", label: "2 min — goated" },
+  { atMs: 150_000, kind: "stage", label: "legendary" },
+  { atMs: 180_000, kind: "milestone", label: "3 min strong" },
+  { atMs: 240_000, kind: "milestone", label: "4 min — canon event" },
+  { atMs: 300_000, kind: "stage", label: "fireworks 🎆" },
+  { atMs: 420_000, kind: "milestone", label: "7 min — immortal" },
+  { atMs: 600_000, kind: "milestone", label: "10 min — eternal" },
+];
+
+type BondState = {
+  since: number;
+  centerX: number;
+  centerY: number;
+  shownMilestones: Set<number>;
+  milestoneLabel: string | null;
+  milestoneUntil: number;
+  loveRings: Array<{ bornAt: number }>;
+  lastSparkleAt: number;
+  lastPetalAt: number;
+  lastShootingStarAt: number;
+  lastFireworkAt: number;
+};
+
+function bondStageFor(age: number): number {
+  if (age < 10_000) return 0;
+  if (age < 25_000) return 1;
+  if (age < 50_000) return 2;
+  if (age < 90_000) return 3;
+  if (age < 150_000) return 4;
+  if (age < 300_000) return 5;
+  return 6;
+}
 
 const BOMB_PHRASES = [
   "thinking of u",
@@ -237,7 +341,7 @@ export default function Home() {
   const lastCrashAtRef = useRef<number>(0);
   const overlapActiveRef = useRef<boolean>(false);
   const overlapStartedAtRef = useRef<number | null>(null);
-  const bondedRef = useRef<{ since: number; centerX: number; centerY: number } | null>(null);
+  const bondedRef = useRef<BondState | null>(null);
   const lastHeartbeatAtRef = useRef<number>(0);
 
   // Doodle strokes
@@ -727,6 +831,82 @@ export default function Home() {
     }
   }, []);
 
+  const spawnRisingSparkle = useCallback((cx: number, cy: number) => {
+    const hue = 300 + Math.random() * 60;
+    particlesRef.current.push({
+      x: cx + (Math.random() - 0.5) * 30,
+      y: cy + (Math.random() - 0.5) * 10,
+      vx: (Math.random() - 0.5) * 30,
+      vy: -60 - Math.random() * 50,
+      life: 0,
+      max: 1800 + Math.random() * 800,
+      color: `hsl(${hue}, 100%, 85%)`,
+      size: 2 + Math.random() * 3,
+      kind: "sparkle-rise",
+    });
+  }, []);
+
+  const spawnFallingPetal = useCallback(() => {
+    const W = window.innerWidth;
+    particlesRef.current.push({
+      x: Math.random() * W,
+      y: -20,
+      vx: (Math.random() - 0.5) * 30,
+      vy: 30 + Math.random() * 40,
+      life: 0,
+      max: 5000 + Math.random() * 2500,
+      color: Math.random() < 0.5 ? "#ffb6d5" : "#ffd3e8",
+      size: 6 + Math.random() * 5,
+      kind: "petal",
+      gravity: 10,
+      rot: Math.random() * Math.PI * 2,
+      spin: (Math.random() - 0.5) * 1.5,
+      sway: Math.random() * 1000,
+    });
+  }, []);
+
+  const spawnShootingStar = useCallback(() => {
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+    const fromLeft = Math.random() < 0.5;
+    const startY = Math.random() * H * 0.5;
+    const startX = fromLeft ? -40 : W + 40;
+    const angle = fromLeft ? Math.PI / 6 + Math.random() * 0.2 : Math.PI - Math.PI / 6 - Math.random() * 0.2;
+    const speed = 500 + Math.random() * 300;
+    particlesRef.current.push({
+      x: startX,
+      y: startY,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 0,
+      max: 1400,
+      color: "rgba(255, 240, 230, 1)",
+      size: 3,
+      kind: "star-streak",
+    });
+  }, []);
+
+  const spawnFirework = useCallback((cx: number, cy: number) => {
+    const hue = Math.floor(Math.random() * 360);
+    const count = 18;
+    for (let i = 0; i < count; i++) {
+      const a = (i / count) * Math.PI * 2 + Math.random() * 0.1;
+      const v = 140 + Math.random() * 120;
+      particlesRef.current.push({
+        x: cx,
+        y: cy,
+        vx: Math.cos(a) * v,
+        vy: Math.sin(a) * v,
+        life: 0,
+        max: 900 + Math.random() * 500,
+        color: `hsl(${hue + Math.random() * 40}, 95%, 70%)`,
+        size: 2.5 + Math.random() * 2,
+        kind: "firework",
+        gravity: 40,
+      });
+    }
+  }, []);
+
   const spawnHeartField = useCallback((bbox: { x: number; y: number; w: number; h: number }) => {
     const W = window.innerWidth;
     const H = window.innerHeight;
@@ -1057,7 +1237,19 @@ export default function Home() {
 
         if (overlapDur >= BOND_THRESHOLD_MS) {
           if (!bondedRef.current) {
-            bondedRef.current = { since: now, centerX: cx, centerY: cy };
+            bondedRef.current = {
+              since: now,
+              centerX: cx,
+              centerY: cy,
+              shownMilestones: new Set<number>(),
+              milestoneLabel: null,
+              milestoneUntil: 0,
+              loveRings: [],
+              lastSparkleAt: 0,
+              lastPetalAt: 0,
+              lastShootingStarAt: 0,
+              lastFireworkAt: 0,
+            };
             spawnHearts(cx, cy, 26);
             vibrate([60, 80, 40, 80, 60]);
             if (soundOnRef.current) playFanfare();
@@ -1105,6 +1297,17 @@ export default function Home() {
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, W, H);
 
+      // Stage 5+ bond: gentle hue wash over the background
+      if (bondedRef.current && bondStageFor(now - bondedRef.current.since) >= 5) {
+        const hue = (now * 0.02) % 360;
+        ctx.save();
+        ctx.globalAlpha = 0.18;
+        ctx.globalCompositeOperation = "overlay";
+        ctx.fillStyle = `hsl(${hue}, 80%, 28%)`;
+        ctx.fillRect(0, 0, W, H);
+        ctx.restore();
+      }
+
       // Constellation stars in the background
       drawStars(ctx, starsRef.current, W, H, now);
 
@@ -1146,6 +1349,73 @@ export default function Home() {
       const mine = myHoldRef.current;
 
       if (bonded && mine && theirs) {
+        const bondAge = now - bonded.since;
+        const stage = bondStageFor(bondAge);
+
+        // Fire milestones / stage unlocks
+        for (const ms of BOND_MILESTONES) {
+          if (bondAge >= ms.atMs && !bonded.shownMilestones.has(ms.atMs)) {
+            bonded.shownMilestones.add(ms.atMs);
+            bonded.milestoneLabel = ms.label;
+            bonded.milestoneUntil = now + 4500;
+            if (ms.kind === "stage") {
+              spawnHearts(bonded.centerX, bonded.centerY, 22);
+              vibrate([50, 60, 40, 80]);
+              if (soundOnRef.current) playFanfare();
+            } else {
+              spawnHearts(bonded.centerX, bonded.centerY, 10);
+              vibrate([30, 40]);
+              if (soundOnRef.current) playBlip(660, 0.16, 0.11, "triangle");
+            }
+          }
+        }
+
+        // Stage-driven continuous effects
+        if (stage >= 1 && now - bonded.lastSparkleAt > 260) {
+          bonded.lastSparkleAt = now;
+          spawnRisingSparkle(bonded.centerX, bonded.centerY);
+        }
+        if (stage >= 2 && now - bonded.lastPetalAt > 720) {
+          bonded.lastPetalAt = now;
+          spawnFallingPetal();
+        }
+        if (stage >= 3) {
+          const lastRing = bonded.loveRings[bonded.loveRings.length - 1];
+          if (!lastRing || now - lastRing.bornAt > 3200) {
+            bonded.loveRings.push({ bornAt: now });
+          }
+        }
+        if (stage >= 4 && now - bonded.lastShootingStarAt > 5800) {
+          bonded.lastShootingStarAt = now;
+          spawnShootingStar();
+        }
+        if (stage >= 6 && now - bonded.lastFireworkAt > 3400) {
+          bonded.lastFireworkAt = now;
+          spawnFirework(
+            bonded.centerX + (Math.random() - 0.5) * 260,
+            bonded.centerY + (Math.random() - 0.5) * 180
+          );
+        }
+        bonded.loveRings = bonded.loveRings.filter((r) => now - r.bornAt < 3500);
+
+        // Edge glow overlay (stage 4+)
+        if (stage >= 4) {
+          ctx.save();
+          const edge = ctx.createRadialGradient(
+            W / 2,
+            H / 2,
+            Math.min(W, H) * 0.32,
+            W / 2,
+            H / 2,
+            Math.max(W, H) * 0.72
+          );
+          edge.addColorStop(0, "rgba(255, 79, 168, 0)");
+          edge.addColorStop(1, "rgba(255, 79, 168, 0.18)");
+          ctx.fillStyle = edge;
+          ctx.fillRect(0, 0, W, H);
+          ctx.restore();
+        }
+
         drawTrail(ctx, theirs, W, H, now);
         drawTrail(ctx, mine, W, H, now);
         drawHeldRipple(ctx, {
@@ -1174,6 +1444,8 @@ export default function Home() {
           r: bondedR,
           now,
           since: bonded.since,
+          stage,
+          loveRings: bonded.loveRings,
         });
         drawBondLabel(ctx, bonded, now, bondedR);
 
@@ -1228,6 +1500,48 @@ export default function Home() {
         ctx.globalAlpha = Math.max(0, lp);
         if (p.kind === "heart") {
           drawHeart(ctx, p.x, p.y, p.size * (0.6 + lp * 0.6), p.color, p.rot || 0);
+        } else if (p.kind === "petal") {
+          const swayOffset = Math.sin((p.life + (p.sway || 0)) * 0.004) * 22;
+          ctx.save();
+          ctx.translate(p.x + swayOffset, p.y);
+          ctx.rotate(p.rot || 0);
+          ctx.fillStyle = p.color;
+          ctx.shadowColor = p.color;
+          ctx.shadowBlur = 6;
+          ctx.beginPath();
+          ctx.ellipse(0, 0, p.size, p.size * 0.55, 0, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        } else if (p.kind === "star-streak") {
+          const vmag = Math.hypot(p.vx, p.vy) || 1;
+          const ux = p.vx / vmag;
+          const uy = p.vy / vmag;
+          const tailLen = 60 + lp * 40;
+          const gx = p.x - ux * tailLen;
+          const gy = p.y - uy * tailLen;
+          const grad = ctx.createLinearGradient(gx, gy, p.x, p.y);
+          grad.addColorStop(0, "rgba(255, 240, 220, 0)");
+          grad.addColorStop(1, `rgba(255, 250, 230, ${lp})`);
+          ctx.strokeStyle = grad;
+          ctx.lineWidth = 2.5;
+          ctx.lineCap = "round";
+          ctx.beginPath();
+          ctx.moveTo(gx, gy);
+          ctx.lineTo(p.x, p.y);
+          ctx.stroke();
+          ctx.fillStyle = `rgba(255, 255, 240, ${lp})`;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
+          ctx.fill();
+        } else if (p.kind === "sparkle-rise" || p.kind === "firework" || p.kind === "spark") {
+          ctx.save();
+          ctx.fillStyle = p.color;
+          ctx.shadowColor = p.color;
+          ctx.shadowBlur = 8;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.size * (0.4 + lp * 0.8), 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
         } else {
           ctx.fillStyle = p.color;
           ctx.beginPath();
@@ -1272,6 +1586,10 @@ export default function Home() {
     addStar,
     spawnHearts,
     spawnHeartField,
+    spawnRisingSparkle,
+    spawnFallingPetal,
+    spawnShootingStar,
+    spawnFirework,
     playBlip,
     playFanfare,
   ]);
@@ -2029,11 +2347,74 @@ function drawBomb(
 
 function drawBondedRipple(
   ctx: CanvasRenderingContext2D,
-  opts: { x: number; y: number; r: number; now: number; since: number }
+  opts: {
+    x: number;
+    y: number;
+    r: number;
+    now: number;
+    since: number;
+    stage: number;
+    loveRings: Array<{ bornAt: number }>;
+  }
 ) {
   const age = opts.now - opts.since;
   const pulse = 1 + Math.sin(age * 0.006) * 0.12;
   const R = opts.r * pulse;
+
+  // Stage 5+: giant outer halo
+  if (opts.stage >= 5) {
+    const megaR = R * 2.8;
+    const mega = ctx.createRadialGradient(opts.x, opts.y, R * 1.3, opts.x, opts.y, megaR);
+    mega.addColorStop(0, "rgba(255, 120, 200, 0.18)");
+    mega.addColorStop(1, "rgba(160, 100, 255, 0)");
+    ctx.fillStyle = mega;
+    ctx.beginPath();
+    ctx.arc(opts.x, opts.y, megaR, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Stage 2+: aurora ribbons orbiting the ripple
+  if (opts.stage >= 2) {
+    for (let r = 0; r < 3; r++) {
+      const hue = (280 + r * 40 + age * 0.02) % 360;
+      ctx.save();
+      ctx.translate(opts.x, opts.y);
+      ctx.rotate(age * 0.00045 * (r % 2 === 0 ? 1 : -1) + r * 1.8);
+      ctx.strokeStyle = `hsla(${hue}, 85%, 72%, 0.32)`;
+      ctx.lineWidth = 3;
+      const ribbonR = R * 1.55 + r * 16;
+      ctx.beginPath();
+      ctx.arc(0, 0, ribbonR, -Math.PI * 0.6, Math.PI * 0.6);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // Stage 3+: love rings (expanding with hearts)
+  if (opts.stage >= 3) {
+    for (const ring of opts.loveRings) {
+      const t = (opts.now - ring.bornAt) / 3500;
+      if (t >= 1) continue;
+      const maxSpread = Math.max(opts.r * 3, 220);
+      const ringR = R + t * maxSpread;
+      const alpha = (1 - t) * 0.55;
+      ctx.strokeStyle = `rgba(255, 150, 200, ${alpha})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(opts.x, opts.y, ringR, 0, Math.PI * 2);
+      ctx.stroke();
+      const heartCount = 8;
+      for (let i = 0; i < heartCount; i++) {
+        const a = (i / heartCount) * Math.PI * 2 + t * 2;
+        const hx = opts.x + Math.cos(a) * ringR;
+        const hy = opts.y + Math.sin(a) * ringR;
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        drawHeart(ctx, hx, hy, 8 + t * 4, "#ff6fae", 0);
+        ctx.restore();
+      }
+    }
+  }
 
   const halo = ctx.createRadialGradient(opts.x, opts.y, 0, opts.x, opts.y, R * 2);
   halo.addColorStop(0, "rgba(255, 160, 210, 0.35)");
@@ -2109,30 +2490,59 @@ function drawBondedRipple(
     const py = opts.y + Math.sin(a) * orbitR;
     drawStar(ctx, px, py, 3 + Math.sin(age * 0.004 + i) * 1.5, "rgba(255, 240, 245, 0.85)");
   }
+
+  // Stage 1+: inner counter-rotating orbital
+  if (opts.stage >= 1) {
+    const innerR = R * 0.62;
+    for (let i = 0; i < 4; i++) {
+      const a = age * 0.0017 + (i / 4) * Math.PI * 2;
+      const px = opts.x + Math.cos(a) * innerR;
+      const py = opts.y + Math.sin(a) * innerR;
+      drawStar(ctx, px, py, 2 + Math.sin(age * 0.005 + i) * 1, "rgba(220, 200, 255, 0.9)");
+    }
+  }
 }
 
 function drawBondLabel(
   ctx: CanvasRenderingContext2D,
-  bond: { since: number; centerX: number; centerY: number },
+  bond: BondState,
   now: number,
   bondR: number
 ) {
   const bondAge = now - bond.since;
-  const idx = Math.floor(bondAge / BOND_LABEL_CYCLE_MS) % BOND_LABELS.length;
-  const label = BOND_LABELS[idx];
-  const phase = (bondAge % BOND_LABEL_CYCLE_MS) / BOND_LABEL_CYCLE_MS;
+  const isMilestone = bond.milestoneLabel && now < bond.milestoneUntil;
+  let label: string;
   let alpha: number;
-  if (phase < 0.2) alpha = phase / 0.2;
-  else if (phase > 0.8) alpha = (1 - phase) / 0.2;
-  else alpha = 1;
-  alpha *= 0.5;
+  let fontSize: number;
+  let weight: number;
+  if (isMilestone) {
+    label = bond.milestoneLabel as string;
+    const remainingT = (bond.milestoneUntil - now) / 4500; // 1 → 0
+    if (remainingT > 0.85) alpha = (1 - remainingT) / 0.15;
+    else if (remainingT < 0.2) alpha = remainingT / 0.2;
+    else alpha = 1;
+    fontSize = 17;
+    weight = 800;
+  } else {
+    // Pseudo-random no-consecutive-repeat selection; 7 coprime with label count.
+    const tick = Math.floor(bondAge / BOND_LABEL_CYCLE_MS);
+    const idx = (((tick * 7) % BOND_LABELS.length) + BOND_LABELS.length) % BOND_LABELS.length;
+    label = BOND_LABELS[idx];
+    const phase = (bondAge % BOND_LABEL_CYCLE_MS) / BOND_LABEL_CYCLE_MS;
+    if (phase < 0.2) alpha = phase / 0.2;
+    else if (phase > 0.8) alpha = (1 - phase) / 0.2;
+    else alpha = 1;
+    alpha *= 0.55;
+    fontSize = 13;
+    weight = 600;
+  }
   ctx.save();
   ctx.globalCompositeOperation = "source-over";
-  ctx.font = "600 13px -apple-system, BlinkMacSystemFont, sans-serif";
+  ctx.font = `${weight} ${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.shadowColor = "rgba(0,0,0,0.6)";
-  ctx.shadowBlur = 6;
+  ctx.shadowColor = "rgba(0,0,0,0.7)";
+  ctx.shadowBlur = 8;
   ctx.fillStyle = `rgba(255, 230, 240, ${alpha})`;
   ctx.fillText(label, bond.centerX, bond.centerY + bondR + 28);
   ctx.restore();
