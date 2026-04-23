@@ -5,6 +5,6 @@ export const runtime = "nodejs";
 
 export async function POST(req: NextRequest) {
   const body = await req.json();
-  await pusherServer.trigger(CHANNEL, "break", body);
+  await pusherServer.trigger(CHANNEL, "hold", body);
   return NextResponse.json({ ok: true });
 }

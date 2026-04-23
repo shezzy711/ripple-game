@@ -5,16 +5,24 @@ import Pusher, { Channel } from "pusher-js";
 
 type User = "shehzaad" | "maggie";
 
-type Ripple = {
+type Tap = {
   id: string;
   user: User;
   x: number;
   y: number;
-  intensity: number;
-  createdAt: number;
-  duration: number;
-  genZ?: string;
-  broken?: { by: User; at: number };
+  bornAt: number; // local performance.now()
+};
+
+type Hold = {
+  id: string;
+  user: User;
+  x: number;
+  y: number;
+  startedAt: number;
+  lastMoveAt: number;
+  ending?: boolean;
+  endedAt?: number;
+  trail: Array<{ x: number; y: number; t: number }>;
 };
 
 type Particle = {
@@ -26,8 +34,7 @@ type Particle = {
   max: number;
   color: string;
   size: number;
-  kind: "spark" | "star" | "shard" | "heart" | "emoji";
-  char?: string;
+  kind: "heart" | "spark";
   gravity?: number;
   rot?: number;
   spin?: number;
@@ -45,21 +52,6 @@ const PALETTE = {
     bg1: "#0a0015",
     bg2: "#00081a",
     buttonBg: "linear-gradient(135deg, #00f0ff 0%, #a020ff 100%)",
-    genZ: [
-      "locked in",
-      "mogged",
-      "no diff",
-      "+1000 aura",
-      "sigma",
-      "mewing",
-      "pressmaxxing",
-      "ripplemaxxing",
-      "hunter eyes",
-      "goated",
-      "gigachad",
-      "PSL 8",
-    ],
-    emoji: ["⚡", "🔥", "💥", "⭐", "💀", "🗿"],
     pushEmoji: "⚡",
   },
   maggie: {
@@ -71,43 +63,21 @@ const PALETTE = {
     bg1: "#1a0010",
     bg2: "#2a0020",
     buttonBg: "linear-gradient(135deg, #ff4fa8 0%, #ffb6c1 100%)",
-    genZ: [
-      "clav maxxing",
-      "mogging",
-      "hollow cheeks",
-      "+500 aura",
-      "hunter eyes",
-      "mewing",
-      "stacey",
-      "mother",
-      "PSL 9",
-      "it's giving",
-      "serving",
-      "ripplemaxxing",
-    ],
-    emoji: ["💖", "✨", "🌸", "💕", "🦋", "🩷"],
     pushEmoji: "💕",
   },
 } as const;
 
-const COMBO_TIERS: Array<{ at: number; label: string; emoji: string; color: string }> = [
-  { at: 3, label: "locked in", emoji: "🔒", color: "#00f0ff" },
-  { at: 6, label: "mogging", emoji: "🥶", color: "#a020ff" },
-  { at: 10, label: "ripplemaxxing", emoji: "🌊", color: "#00f0ff" },
-  { at: 16, label: "+500 aura", emoji: "✴️", color: "#c084fc" },
-  { at: 24, label: "clavicle maxxing", emoji: "🦴", color: "#fde047" },
-  { at: 35, label: "pressmaxxing", emoji: "👆", color: "#ff4fa8" },
-  { at: 50, label: "PSL 10", emoji: "📊", color: "#00ff88" },
-];
-
-const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const HOLD_THRESHOLD_MS = 180;
+const MOVE_MIN_INTERVAL_MS = 80;
+const MOVE_MIN_DELTA = 0.005;
+const HOLD_STALE_MS = 3000;
+const DECAY_MS = 600;
+const TAP_LIFE_MS = 650;
+const CRASH_INITIAL_COOLDOWN = 400;
+const CRASH_TRICKLE_COOLDOWN = 150;
 const CHANNEL = "ripple-room";
 
-function getComboTier(count: number) {
-  let tier = null;
-  for (const t of COMBO_TIERS) if (count >= t.at) tier = t;
-  return tier;
-}
+const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 
 function urlBase64ToUint8Array(base64String: string) {
   const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
@@ -124,36 +94,46 @@ export default function Home() {
   const [pushStatus, setPushStatus] = useState<"idle" | "pending" | "granted" | "denied" | "unsupported">("idle");
   const [isStandalone, setIsStandalone] = useState(false);
   const [showInstallHint, setShowInstallHint] = useState(false);
-  const [comboDisplay, setComboDisplay] = useState<{ count: number; tier: typeof COMBO_TIERS[number] | null } | null>(null);
-  const [fusionCount, setFusionCount] = useState(0);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const ripplesRef = useRef<Map<string, Ripple>>(new Map());
+  const userRef = useRef<User | null>(null);
+
+  const myHoldRef = useRef<Hold | null>(null);
+  const theirHoldRef = useRef<Hold | null>(null);
+  const decayingHoldsRef = useRef<Hold[]>([]);
+  const tapsRef = useRef<Tap[]>([]);
   const particlesRef = useRef<Particle[]>([]);
-  const holdRef = useRef<{
+
+  // Pointer session tracking
+  const pointerSessionRef = useRef<{
+    pointerId: number;
+    startedAt: number; // perf.now
     x: number;
     y: number;
-    startedAt: number;
-    pointerId: number;
-    breakTargetId?: string;
+    holdId: string | null; // set when we cross the threshold
+    lastSendAt: number;
+    lastSentX: number;
+    lastSentY: number;
   } | null>(null);
-  const userRef = useRef<User | null>(null);
+
+  // Crash
+  const lastCrashAtRef = useRef<number>(0);
+  const overlapActiveRef = useRef<boolean>(false);
+
+  // Push + Pusher
   const channelRef = useRef<Channel | null>(null);
   const ownSubRef = useRef<PushSub | null>(null);
   const otherSubRef = useRef<PushSub | null>(null);
   const lastSubBroadcastRef = useRef<number>(0);
   const lastPushSentRef = useRef<number>(0);
-  const comboRef = useRef<{ count: number; lastAt: number }>({ count: 0, lastAt: 0 });
 
   useEffect(() => {
     const saved = (typeof window !== "undefined" && localStorage.getItem("ripple-user")) as User | null;
     if (saved === "shehzaad" || saved === "maggie") setUser(saved);
-    // restore other sub
     try {
       const s = localStorage.getItem("ripple-other-sub");
       if (s) otherSubRef.current = JSON.parse(s);
     } catch {}
-    // check standalone
     if (typeof window !== "undefined") {
       const standalone =
         window.matchMedia("(display-mode: standalone)").matches ||
@@ -171,13 +151,12 @@ export default function Home() {
     localStorage.setItem("ripple-user", u);
     setUser(u);
   };
-
   const resetUser = () => {
     localStorage.removeItem("ripple-user");
     setUser(null);
   };
 
-  // Register service worker
+  // Service worker
   useEffect(() => {
     if (!user) return;
     if (typeof window === "undefined" || !("serviceWorker" in navigator)) {
@@ -187,7 +166,6 @@ export default function Home() {
     navigator.serviceWorker
       .register("/sw.js")
       .then(async () => {
-        // Check existing subscription
         const reg = await navigator.serviceWorker.ready;
         const existing = await reg.pushManager.getSubscription();
         if (existing) {
@@ -198,15 +176,6 @@ export default function Home() {
         }
       })
       .catch(() => setPushStatus("unsupported"));
-
-    // Receive messages from the SW (e.g. push-while-visible)
-    const onMsg = (e: MessageEvent) => {
-      if (e.data?.type === "push-while-visible") {
-        // could add a subtle animation; for now, no-op
-      }
-    };
-    navigator.serviceWorker.addEventListener("message", onMsg);
-    return () => navigator.serviceWorker.removeEventListener("message", onMsg);
   }, [user]);
 
   const enablePush = async () => {
@@ -231,8 +200,7 @@ export default function Home() {
           userVisibleOnly: true,
           applicationServerKey: urlBase64ToUint8Array(pub),
         }));
-      const subJson = sub.toJSON() as PushSub;
-      ownSubRef.current = subJson;
+      ownSubRef.current = sub.toJSON() as PushSub;
       setPushStatus("granted");
       broadcastOwnSub();
     } catch {
@@ -243,8 +211,7 @@ export default function Home() {
   const broadcastOwnSub = useCallback(() => {
     const me = userRef.current;
     const sub = ownSubRef.current;
-    const ch = channelRef.current;
-    if (!me || !sub || !ch) return;
+    if (!me || !sub) return;
     const now = Date.now();
     if (now - lastSubBroadcastRef.current < 5000) return;
     lastSubBroadcastRef.current = now;
@@ -261,7 +228,6 @@ export default function Home() {
     const key = process.env.NEXT_PUBLIC_PUSHER_KEY;
     const cluster = process.env.NEXT_PUBLIC_PUSHER_CLUSTER;
     if (!key || !cluster) return;
-
     const pusher = new Pusher(key, { cluster });
     const channel = pusher.subscribe(CHANNEL);
     channelRef.current = channel;
@@ -274,25 +240,64 @@ export default function Home() {
       setConnected(s.current === "connected");
     });
 
-    channel.bind("ripple", (data: Ripple) => {
-      if (ripplesRef.current.has(data.id)) return;
-      ripplesRef.current.set(data.id, data);
-      // heart fusion: if we have a local ripple overlapping, burst hearts
-      if (data.user !== userRef.current) checkFusion(data);
+    channel.bind("tap", (data: { id: string; user: User; x: number; y: number }) => {
+      if (data.user === userRef.current) return;
+      tapsRef.current.push({
+        id: data.id,
+        user: data.user,
+        x: data.x,
+        y: data.y,
+        bornAt: performance.now(),
+      });
     });
 
-    channel.bind("break", (data: { id: string; by: User; at: number }) => {
-      const r = ripplesRef.current.get(data.id);
-      if (!r || r.broken) return;
-      r.broken = { by: data.by, at: data.at };
-      spawnShatter(r, data.by);
-    });
+    channel.bind(
+      "hold",
+      (data: {
+        action: "start" | "move" | "end";
+        id: string;
+        user: User;
+        x?: number;
+        y?: number;
+      }) => {
+        if (data.user === userRef.current) return;
+        if (data.action === "start") {
+          const now = performance.now();
+          theirHoldRef.current = {
+            id: data.id,
+            user: data.user,
+            x: data.x ?? 0.5,
+            y: data.y ?? 0.5,
+            startedAt: now,
+            lastMoveAt: now,
+            trail: [{ x: data.x ?? 0.5, y: data.y ?? 0.5, t: now }],
+          };
+        } else if (data.action === "move") {
+          const cur = theirHoldRef.current;
+          if (!cur || cur.id !== data.id) return;
+          const now = performance.now();
+          cur.x = data.x ?? cur.x;
+          cur.y = data.y ?? cur.y;
+          cur.lastMoveAt = now;
+          cur.trail.push({ x: cur.x, y: cur.y, t: now });
+          if (cur.trail.length > 8) cur.trail.shift();
+        } else if (data.action === "end") {
+          const cur = theirHoldRef.current;
+          if (!cur || cur.id !== data.id) return;
+          cur.ending = true;
+          cur.endedAt = performance.now();
+          decayingHoldsRef.current.push(cur);
+          theirHoldRef.current = null;
+        }
+      }
+    );
 
     channel.bind("push-sub", (data: { user: User; sub: PushSub }) => {
       if (data.user === userRef.current) return;
       otherSubRef.current = data.sub;
-      try { localStorage.setItem("ripple-other-sub", JSON.stringify(data.sub)); } catch {}
-      // reciprocate once so the other side gets ours if they haven't yet
+      try {
+        localStorage.setItem("ripple-other-sub", JSON.stringify(data.sub));
+      } catch {}
       if (ownSubRef.current) broadcastOwnSub();
     });
 
@@ -304,55 +309,7 @@ export default function Home() {
     };
   }, [user, broadcastOwnSub]);
 
-  const checkFusion = (incoming: Ripple) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const me = userRef.current;
-    if (!me) return;
-    const rect = canvas.getBoundingClientRect();
-    const now = performance.now();
-    const minSide = Math.min(window.innerWidth, window.innerHeight);
-    const incomingAt = Date.now() > 1e11 ? incoming.createdAt - (Date.now() - performance.now()) : incoming.createdAt;
-    const ix = incoming.x * rect.width;
-    const iy = incoming.y * rect.height;
-    ripplesRef.current.forEach((r) => {
-      if (r.id === incoming.id) return;
-      if (r.user === incoming.user) return;
-      if (r.broken) return;
-      const age = now - r.createdAt;
-      if (age > r.duration) return;
-      const cx = r.x * rect.width;
-      const cy = r.y * rect.height;
-      const d = Math.hypot(ix - cx, iy - cy);
-      const maxR = (0.2 + Math.max(r.intensity, incoming.intensity) * 0.5) * minSide;
-      if (d < maxR) {
-        spawnHearts((ix + cx) / 2, (iy + cy) / 2, 22);
-        setFusionCount((c) => c + 1);
-      }
-    });
-    void incomingAt;
-  };
-
-  const broadcastRipple = useCallback(async (ripple: Ripple) => {
-    try {
-      await fetch("/api/ripple", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(ripple),
-      });
-    } catch {}
-  }, []);
-
-  const broadcastBreak = useCallback(async (payload: { id: string; by: User; at: number }) => {
-    try {
-      await fetch("/api/break", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-    } catch {}
-  }, []);
-
+  // Push notification fire (local side)
   const sendPushMaybe = useCallback(async () => {
     const sub = otherSubRef.current;
     const me = userRef.current;
@@ -376,113 +333,53 @@ export default function Home() {
     } catch {}
   }, []);
 
-  const spawnShatter = (r: Ripple, by: User) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const cx = r.x * rect.width;
-    const cy = r.y * rect.height;
-    const col = PALETTE[r.user];
-    const count = 28 + Math.floor(r.intensity * 30);
-    for (let i = 0; i < count; i++) {
-      const angle = (i / count) * Math.PI * 2 + Math.random() * 0.3;
-      const speed = 120 + Math.random() * 260 * (0.5 + r.intensity);
-      particlesRef.current.push({
-        x: cx,
-        y: cy,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed,
-        life: 0,
-        max: 700 + Math.random() * 500,
-        color: `rgb(${col.primary.join(",")})`,
-        size: 2 + Math.random() * 3,
-        kind: "shard",
-      });
-    }
-    const br = PALETTE[by];
-    for (let i = 0; i < 12; i++) {
-      const angle = Math.random() * Math.PI * 2;
-      const speed = 80 + Math.random() * 160;
-      particlesRef.current.push({
-        x: cx,
-        y: cy,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed,
-        life: 0,
-        max: 600 + Math.random() * 400,
-        color: `rgb(${br.accent.join(",")})`,
-        size: 3 + Math.random() * 4,
-        kind: "star",
-      });
-    }
-  };
+  const postTap = useCallback((tap: { id: string; user: User; x: number; y: number }) => {
+    fetch("/api/tap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(tap),
+    }).catch(() => {});
+  }, []);
+
+  const postHold = useCallback(
+    (payload: {
+      action: "start" | "move" | "end";
+      id: string;
+      user: User;
+      x?: number;
+      y?: number;
+    }) => {
+      fetch("/api/hold", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).catch(() => {});
+    },
+    []
+  );
 
   const spawnHearts = (cx: number, cy: number, count: number) => {
     for (let i = 0; i < count; i++) {
       const angle = (i / count) * Math.PI * 2 + Math.random() * 0.4;
-      const speed = 60 + Math.random() * 180;
+      const speed = 70 + Math.random() * 160;
       particlesRef.current.push({
         x: cx,
         y: cy,
         vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed - 80,
+        vy: Math.sin(angle) * speed - 60,
         life: 0,
-        max: 1400 + Math.random() * 800,
+        max: 1200 + Math.random() * 700,
         color: "#ff4fa8",
-        size: 14 + Math.random() * 14,
+        size: 12 + Math.random() * 12,
         kind: "heart",
-        gravity: 60,
+        gravity: 80,
         rot: Math.random() * Math.PI * 2,
-        spin: (Math.random() - 0.5) * 2,
+        spin: (Math.random() - 0.5) * 2.5,
       });
     }
   };
 
-  const spawnEmojiBurst = (cx: number, cy: number, user: User, intensity: number) => {
-    const pool = PALETTE[user].emoji;
-    const count = 6 + Math.floor(intensity * 10);
-    for (let i = 0; i < count; i++) {
-      const angle = -Math.PI / 2 + (Math.random() - 0.5) * 1.6;
-      const speed = 140 + Math.random() * 220;
-      particlesRef.current.push({
-        x: cx + (Math.random() - 0.5) * 20,
-        y: cy,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed,
-        life: 0,
-        max: 1500 + Math.random() * 800,
-        color: "#ffffff",
-        size: 22 + Math.random() * 16,
-        kind: "emoji",
-        char: pool[Math.floor(Math.random() * pool.length)],
-        gravity: 400,
-        rot: (Math.random() - 0.5) * 0.6,
-        spin: (Math.random() - 0.5) * 4,
-      });
-    }
-  };
-
-  const bumpCombo = () => {
-    const now = performance.now();
-    if (now - comboRef.current.lastAt > 2000) comboRef.current.count = 0;
-    comboRef.current.count += 1;
-    comboRef.current.lastAt = now;
-    const tier = getComboTier(comboRef.current.count);
-    setComboDisplay({ count: comboRef.current.count, tier });
-  };
-
-  // decay combo display
-  useEffect(() => {
-    const id = setInterval(() => {
-      if (comboRef.current.count > 0 && performance.now() - comboRef.current.lastAt > 2200) {
-        comboRef.current.count = 0;
-        setComboDisplay(null);
-      }
-    }, 300);
-    return () => clearInterval(id);
-  }, []);
-
-  // Pointer + animation
+  // Pointer + render
   useEffect(() => {
     if (!user) return;
     const canvas = canvasRef.current;
@@ -503,7 +400,9 @@ export default function Home() {
 
     const vibrate = (pattern: number | number[]) => {
       if (typeof navigator !== "undefined" && "vibrate" in navigator) {
-        try { navigator.vibrate(pattern); } catch {}
+        try {
+          navigator.vibrate(pattern);
+        } catch {}
       }
     };
 
@@ -512,126 +411,159 @@ export default function Home() {
       return {
         x: (e.clientX - rect.left) / rect.width,
         y: (e.clientY - rect.top) / rect.height,
-        px: e.clientX - rect.left,
-        py: e.clientY - rect.top,
       };
     };
 
-    const currentRadius = (r: Ripple, now: number) => {
-      const age = now - r.createdAt;
-      const p = Math.min(age / r.duration, 1);
-      const maxR = (0.15 + r.intensity * 0.55) * Math.min(window.innerWidth, window.innerHeight);
-      return maxR * (1 - Math.pow(1 - p, 3));
-    };
-
-    const findHit = (px: number, py: number): Ripple | null => {
-      const now = performance.now();
+    const promoteToHold = (now: number) => {
+      const s = pointerSessionRef.current;
       const me = userRef.current;
-      let bestR: Ripple | null = null;
-      let bestD = Infinity;
-      const rect = canvas.getBoundingClientRect();
-      ripplesRef.current.forEach((r) => {
-        if (r.user === me) return;
-        if (r.broken) return;
-        const age = now - r.createdAt;
-        if (age > r.duration) return;
-        const cx = r.x * rect.width;
-        const cy = r.y * rect.height;
-        const rad = currentRadius(r, now);
-        const d = Math.hypot(px - cx, py - cy);
-        if (d <= rad * 1.1 && d < bestD) {
-          bestD = d;
-          bestR = r;
-        }
-      });
-      return bestR;
+      if (!s || s.holdId || !me) return;
+      const id = uid();
+      s.holdId = id;
+      s.lastSendAt = now;
+      s.lastSentX = s.x;
+      s.lastSentY = s.y;
+      myHoldRef.current = {
+        id,
+        user: me,
+        x: s.x,
+        y: s.y,
+        startedAt: s.startedAt,
+        lastMoveAt: now,
+        trail: [{ x: s.x, y: s.y, t: now }],
+      };
+      postHold({ action: "start", id, user: me, x: s.x, y: s.y });
+      vibrate(12);
+      sendPushMaybe();
     };
 
     const onDown = (e: PointerEvent) => {
       e.preventDefault();
       canvas.setPointerCapture(e.pointerId);
-      const { x, y, px, py } = getCoords(e);
-      const hit = findHit(px, py);
-      holdRef.current = {
+      const { x, y } = getCoords(e);
+      const now = performance.now();
+      pointerSessionRef.current = {
+        pointerId: e.pointerId,
+        startedAt: now,
         x,
         y,
-        startedAt: performance.now(),
-        pointerId: e.pointerId,
-        breakTargetId: hit?.id,
+        holdId: null,
+        lastSendAt: 0,
+        lastSentX: x,
+        lastSentY: y,
       };
-      if (hit) vibrate([15, 30, 25]);
-      else vibrate(8);
     };
 
-    const onUp = (e: PointerEvent) => {
-      const hold = holdRef.current;
-      if (!hold || hold.pointerId !== e.pointerId) return;
-      holdRef.current = null;
+    const onMove = (e: PointerEvent) => {
+      const s = pointerSessionRef.current;
+      if (!s || s.pointerId !== e.pointerId) return;
+      const { x, y } = getCoords(e);
+      s.x = x;
+      s.y = y;
+      const now = performance.now();
+
+      if (!s.holdId) {
+        // Maybe promote if past threshold
+        if (now - s.startedAt >= HOLD_THRESHOLD_MS) promoteToHold(now);
+        return;
+      }
+
+      // Active hold: update local and maybe broadcast
+      const hold = myHoldRef.current;
+      if (!hold || hold.id !== s.holdId) return;
+      hold.x = x;
+      hold.y = y;
+      hold.lastMoveAt = now;
+      hold.trail.push({ x, y, t: now });
+      if (hold.trail.length > 8) hold.trail.shift();
+
+      const dx = x - s.lastSentX;
+      const dy = y - s.lastSentY;
+      const delta = Math.hypot(dx, dy);
+      if (now - s.lastSendAt >= MOVE_MIN_INTERVAL_MS && delta >= MOVE_MIN_DELTA) {
+        s.lastSendAt = now;
+        s.lastSentX = x;
+        s.lastSentY = y;
+        postHold({ action: "move", id: s.holdId, user: userRef.current!, x, y });
+      }
+    };
+
+    const finishSession = (e: PointerEvent) => {
+      const s = pointerSessionRef.current;
+      if (!s || s.pointerId !== e.pointerId) return;
+      pointerSessionRef.current = null;
       const me = userRef.current;
       if (!me) return;
-      const heldMs = performance.now() - hold.startedAt;
-      const intensity = Math.min(heldMs / 1800, 1);
-      const now = Date.now();
-      const duration = 2400 + intensity * 3600;
+      const now = performance.now();
 
-      if (hold.breakTargetId) {
-        const target = ripplesRef.current.get(hold.breakTargetId);
-        if (target && !target.broken) {
-          target.broken = { by: me, at: now };
-          spawnShatter(target, me);
-          broadcastBreak({ id: target.id, by: me, at: now });
-          vibrate([20, 40, 60]);
-        }
+      if (!s.holdId) {
+        // It was a tap
+        const tap: Tap = { id: uid(), user: me, x: s.x, y: s.y, bornAt: now };
+        tapsRef.current.push(tap);
+        postTap({ id: tap.id, user: me, x: s.x, y: s.y });
+        sendPushMaybe();
+        return;
       }
 
-      const pal = PALETTE[me];
-      const genZ = Math.random() < 0.45 ? pal.genZ[Math.floor(Math.random() * pal.genZ.length)] : undefined;
-
-      const rippleLocal: Ripple = {
-        id: uid(),
-        user: me,
-        x: hold.x,
-        y: hold.y,
-        intensity,
-        createdAt: performance.now(),
-        duration,
-        genZ,
-      };
-      const sendable: Ripple = { ...rippleLocal, createdAt: now };
-      ripplesRef.current.set(rippleLocal.id, rippleLocal);
-      broadcastRipple(sendable);
-
-      bumpCombo();
-
-      // check heart fusion against existing remote ripples
-      checkFusion(rippleLocal);
-
-      // emoji confetti on long hold
-      if (intensity > 0.4) {
-        const rect = canvas.getBoundingClientRect();
-        spawnEmojiBurst(hold.x * rect.width, hold.y * rect.height, me, intensity);
-        vibrate([25, 20, 40]);
+      // Finish the hold: move to decaying
+      const hold = myHoldRef.current;
+      if (hold && hold.id === s.holdId) {
+        hold.ending = true;
+        hold.endedAt = now;
+        decayingHoldsRef.current.push(hold);
+        myHoldRef.current = null;
       }
-
-      // push notify the other side, throttled
-      sendPushMaybe();
+      postHold({ action: "end", id: s.holdId, user: me });
     };
 
-    const onCancel = (e: PointerEvent) => {
-      if (holdRef.current?.pointerId === e.pointerId) holdRef.current = null;
-    };
+    const onUp = (e: PointerEvent) => finishSession(e);
+    const onCancel = (e: PointerEvent) => finishSession(e);
 
     canvas.addEventListener("pointerdown", onDown);
+    canvas.addEventListener("pointermove", onMove);
     canvas.addEventListener("pointerup", onUp);
     canvas.addEventListener("pointercancel", onCancel);
     canvas.addEventListener("pointerleave", onCancel);
 
-    const normalizeLoop = setInterval(() => {
-      const perfOffset = Date.now() - performance.now();
-      ripplesRef.current.forEach((r) => {
-        if (r.createdAt > 1e11) r.createdAt = r.createdAt - perfOffset;
-      });
-    }, 100);
+    // Held ripple radius scales with hold age, capped
+    const heldRadius = (hold: Hold, now: number) => {
+      const age = Math.max(0, now - hold.startedAt);
+      const growth = 1 - Math.pow(2, -age / 600);
+      const minSide = Math.min(window.innerWidth, window.innerHeight);
+      return (0.08 + growth * 0.18) * minSide;
+    };
+
+    const detectCrash = (now: number) => {
+      const mine = myHoldRef.current;
+      const theirs = theirHoldRef.current;
+      if (!mine || !theirs) {
+        overlapActiveRef.current = false;
+        return;
+      }
+      const W = window.innerWidth;
+      const H = window.innerHeight;
+      const mx = mine.x * W;
+      const my = mine.y * H;
+      const tx = theirs.x * W;
+      const ty = theirs.y * H;
+      const d = Math.hypot(mx - tx, my - ty);
+      const rSum = heldRadius(mine, now) + heldRadius(theirs, now);
+      if (d < rSum * 0.9) {
+        const cx = (mx + tx) / 2;
+        const cy = (my + ty) / 2;
+        if (!overlapActiveRef.current && now - lastCrashAtRef.current > CRASH_INITIAL_COOLDOWN) {
+          spawnHearts(cx, cy, 12);
+          vibrate([20, 30, 40]);
+          overlapActiveRef.current = true;
+          lastCrashAtRef.current = now;
+        } else if (overlapActiveRef.current && now - lastCrashAtRef.current > CRASH_TRICKLE_COOLDOWN) {
+          spawnHearts(cx, cy, 1);
+          lastCrashAtRef.current = now;
+        }
+      } else {
+        overlapActiveRef.current = false;
+      }
+    };
 
     let rafId = 0;
     let lastT = performance.now();
@@ -643,7 +575,6 @@ export default function Home() {
 
       const W = window.innerWidth;
       const H = window.innerHeight;
-
       const me = userRef.current;
       const bgPal = me ? PALETTE[me] : PALETTE.shehzaad;
 
@@ -656,74 +587,78 @@ export default function Home() {
 
       ctx.globalCompositeOperation = "lighter";
 
-      const hold = holdRef.current;
-      if (hold && me) {
-        const heldMs = now - hold.startedAt;
-        const intensity = Math.min(heldMs / 1800, 1);
-        const px = hold.x * W;
-        const py = hold.y * H;
-        const pr = 10 + intensity * Math.min(W, H) * 0.35;
-        const pulse = 1 + Math.sin(now * 0.012) * 0.08;
-        drawRipple(ctx, {
-          x: px,
-          y: py,
-          r: pr * pulse,
-          intensity,
-          progress: 0.2 + intensity * 0.5,
-          user: me,
-          ghost: true,
-          breakTarget: !!hold.breakTargetId,
-        });
+      // Auto-decay stale remote hold (connection drop safety)
+      const staleTheirs = theirHoldRef.current;
+      if (staleTheirs && now - staleTheirs.lastMoveAt > HOLD_STALE_MS) {
+        staleTheirs.ending = true;
+        staleTheirs.endedAt = now;
+        decayingHoldsRef.current.push(staleTheirs);
+        theirHoldRef.current = null;
       }
 
-      const toDelete: string[] = [];
-      ripplesRef.current.forEach((r) => {
-        const age = now - r.createdAt;
-        if (age > r.duration + 200) { toDelete.push(r.id); return; }
-        const p = Math.min(age / r.duration, 1);
-        const rad = currentRadius(r, now);
-        const cx = r.x * W;
-        const cy = r.y * H;
-        const brokenFade = r.broken ? Math.max(0, 1 - (now - (r.broken.at - (Date.now() - performance.now()))) / 500) : 1;
-        drawRipple(ctx, {
-          x: cx,
-          y: cy,
-          r: rad,
-          intensity: r.intensity,
-          progress: p,
-          user: r.user,
-          fade: brokenFade,
-          label: r.genZ,
-        });
+      // Decaying holds
+      decayingHoldsRef.current = decayingHoldsRef.current.filter((h) => {
+        const t = h.endedAt ? (now - h.endedAt) / DECAY_MS : 0;
+        if (t >= 1) return false;
+        const alpha = 1 - t;
+        const cx = h.x * W;
+        const cy = h.y * H;
+        const radius = heldRadius(h, h.endedAt || now) * (1 + t * 0.6);
+        drawHeldRipple(ctx, { x: cx, y: cy, r: radius, user: h.user, alpha: alpha * 0.8, now });
+        return true;
       });
-      toDelete.forEach((id) => ripplesRef.current.delete(id));
 
+      // Their hold
+      const theirs = theirHoldRef.current;
+      if (theirs) {
+        const cx = theirs.x * W;
+        const cy = theirs.y * H;
+        drawTrail(ctx, theirs, W, H, now);
+        drawHeldRipple(ctx, { x: cx, y: cy, r: heldRadius(theirs, now), user: theirs.user, alpha: 0.95, now });
+      }
+
+      // My hold
+      const mine = myHoldRef.current;
+      if (mine) {
+        const cx = mine.x * W;
+        const cy = mine.y * H;
+        drawTrail(ctx, mine, W, H, now);
+        drawHeldRipple(ctx, { x: cx, y: cy, r: heldRadius(mine, now), user: mine.user, alpha: 1, now });
+      }
+
+      // Tap splashes
+      tapsRef.current = tapsRef.current.filter((t) => {
+        const age = now - t.bornAt;
+        if (age > TAP_LIFE_MS) return false;
+        const p = age / TAP_LIFE_MS;
+        const r = (0.02 + p * 0.1) * Math.min(W, H);
+        const alpha = (1 - p) * 0.95;
+        drawSplash(ctx, { x: t.x * W, y: t.y * H, r, user: t.user, alpha });
+        return true;
+      });
+
+      // Crash detection
+      detectCrash(now);
+
+      // Particles
       const pArr = particlesRef.current;
       for (let i = pArr.length - 1; i >= 0; i--) {
         const p = pArr[i];
         p.life += dt;
-        if (p.life > p.max) { pArr.splice(i, 1); continue; }
+        if (p.life > p.max) {
+          pArr.splice(i, 1);
+          continue;
+        }
         if (p.gravity) p.vy += (p.gravity * dt) / 1000;
         p.x += (p.vx * dt) / 1000;
         p.y += (p.vy * dt) / 1000;
-        p.vx *= 0.992;
-        if (!p.gravity) p.vy *= 0.992;
+        p.vx *= 0.99;
+        if (!p.gravity) p.vy *= 0.99;
         if (p.spin) p.rot = (p.rot || 0) + (p.spin * dt) / 1000;
         const lp = 1 - p.life / p.max;
         ctx.globalAlpha = Math.max(0, lp);
-        if (p.kind === "star") {
-          drawStar(ctx, p.x, p.y, p.size * (0.6 + lp * 0.6), p.color);
-        } else if (p.kind === "heart") {
+        if (p.kind === "heart") {
           drawHeart(ctx, p.x, p.y, p.size * (0.6 + lp * 0.6), p.color, p.rot || 0);
-        } else if (p.kind === "emoji") {
-          ctx.save();
-          ctx.translate(p.x, p.y);
-          ctx.rotate(p.rot || 0);
-          ctx.font = `${p.size}px -apple-system, sans-serif`;
-          ctx.textAlign = "center";
-          ctx.textBaseline = "middle";
-          ctx.fillText(p.char || "✨", 0, 0);
-          ctx.restore();
         } else {
           ctx.fillStyle = p.color;
           ctx.beginPath();
@@ -740,14 +675,14 @@ export default function Home() {
 
     return () => {
       cancelAnimationFrame(rafId);
-      clearInterval(normalizeLoop);
       window.removeEventListener("resize", resize);
       canvas.removeEventListener("pointerdown", onDown);
+      canvas.removeEventListener("pointermove", onMove);
       canvas.removeEventListener("pointerup", onUp);
       canvas.removeEventListener("pointercancel", onCancel);
       canvas.removeEventListener("pointerleave", onCancel);
     };
-  }, [user, broadcastRipple, broadcastBreak, sendPushMaybe]);
+  }, [user, postTap, postHold, sendPushMaybe]);
 
   if (!user) {
     return (
@@ -795,7 +730,6 @@ export default function Home() {
     <main style={{ position: "relative", touchAction: "none" }}>
       <canvas ref={canvasRef} style={{ display: "block", width: "100vw", height: "100dvh", touchAction: "none" }} />
 
-      {/* top-left: identity + connection */}
       <div
         style={{
           position: "fixed",
@@ -825,7 +759,6 @@ export default function Home() {
         <span style={{ opacity: 0.9 }}>{pal.name}</span>
       </div>
 
-      {/* top-right: push + switch */}
       <div
         style={{
           position: "fixed",
@@ -889,60 +822,6 @@ export default function Home() {
         </button>
       </div>
 
-      {/* combo badge */}
-      {comboDisplay && comboDisplay.count >= 3 && comboDisplay.tier && (
-        <div
-          key={comboDisplay.tier.label + comboDisplay.count}
-          style={{
-            position: "fixed",
-            bottom: "max(72px, calc(env(safe-area-inset-bottom) + 72px))",
-            right: 20,
-            background: "rgba(0,0,0,0.55)",
-            backdropFilter: "blur(10px)",
-            border: `1.5px solid ${comboDisplay.tier.color}`,
-            padding: "10px 16px",
-            borderRadius: 18,
-            fontSize: 15,
-            fontWeight: 800,
-            letterSpacing: "-0.01em",
-            color: "#fff",
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-            pointerEvents: "none",
-            animation: "pop 0.4s ease-out",
-            boxShadow: `0 0 40px ${comboDisplay.tier.color}80`,
-          }}
-        >
-          <span style={{ fontSize: 22 }}>{comboDisplay.tier.emoji}</span>
-          <span style={{ color: comboDisplay.tier.color }}>{comboDisplay.tier.label}</span>
-          <span style={{ opacity: 0.7 }}>×{comboDisplay.count}</span>
-        </div>
-      )}
-
-      {/* fusion counter */}
-      {fusionCount > 0 && (
-        <div
-          style={{
-            position: "fixed",
-            bottom: "max(72px, calc(env(safe-area-inset-bottom) + 72px))",
-            left: 20,
-            background: "rgba(0,0,0,0.55)",
-            backdropFilter: "blur(10px)",
-            padding: "8px 14px",
-            borderRadius: 18,
-            fontSize: 13,
-            fontWeight: 700,
-            color: "#ff4fa8",
-            pointerEvents: "none",
-            boxShadow: "0 0 30px rgba(255,79,168,0.4)",
-          }}
-        >
-          💕 fused {fusionCount}
-        </div>
-      )}
-
-      {/* bottom hint */}
       <div
         style={{
           position: "fixed",
@@ -955,10 +834,9 @@ export default function Home() {
           pointerEvents: "none",
         }}
       >
-        tap · hold · break theirs · fuse for hearts · keep tapping for aura
+        tap · hold to drag · crash into theirs
       </div>
 
-      {/* install hint for iOS non-standalone */}
       {!isStandalone && pushStatus !== "granted" && !showInstallHint && (
         <button
           onClick={() => setShowInstallHint(true)}
@@ -1008,26 +886,26 @@ export default function Home() {
               textAlign: "center",
             }}
           >
-            <h3 style={{ fontSize: 20, fontWeight: 800, marginBottom: 12, background: pal.buttonBg, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+            <h3
+              style={{
+                fontSize: 20,
+                fontWeight: 800,
+                marginBottom: 12,
+                background: pal.buttonBg,
+                WebkitBackgroundClip: "text",
+                WebkitTextFillColor: "transparent",
+              }}
+            >
               add to home screen
             </h3>
             <p style={{ fontSize: 14, opacity: 0.8, lineHeight: 1.5, marginBottom: 16 }}>
-              tap <strong>Share</strong> → <strong>Add to Home Screen</strong>.
-              open the ripple app from there → tap 🔔 pings → allow notifications.
-              now you&apos;ll get pinged when the other is rippling.
+              tap <strong>Share</strong> → <strong>Add to Home Screen</strong>. open the ripple app from there → tap 🔔
+              pings → allow notifications. now you&apos;ll get pinged when the other is rippling.
             </p>
             <p style={{ fontSize: 12, opacity: 0.5 }}>tap anywhere to close</p>
           </div>
         </div>
       )}
-
-      <style jsx global>{`
-        @keyframes pop {
-          0% { transform: scale(0.6); opacity: 0; }
-          50% { transform: scale(1.15); opacity: 1; }
-          100% { transform: scale(1); opacity: 1; }
-        }
-      `}</style>
     </main>
   );
 }
@@ -1047,110 +925,109 @@ function btnStyle(bg: string): React.CSSProperties {
   };
 }
 
-function drawRipple(
+function drawHeldRipple(
   ctx: CanvasRenderingContext2D,
-  opts: {
-    x: number;
-    y: number;
-    r: number;
-    intensity: number;
-    progress: number;
-    user: User;
-    ghost?: boolean;
-    fade?: number;
-    breakTarget?: boolean;
-    label?: string;
-  }
+  opts: { x: number; y: number; r: number; user: User; alpha: number; now: number }
 ) {
   const pal = PALETTE[opts.user];
-  const fade = opts.fade ?? 1;
-  const lifeAlpha = (1 - opts.progress) * fade;
-  if (lifeAlpha <= 0) return;
-
   const [pr, pg, pb] = pal.primary;
   const [sr, sg, sb] = pal.secondary;
+  const a = opts.alpha;
 
-  const ringCount = 3 + Math.floor(opts.intensity * 4);
-  for (let i = 0; i < ringCount; i++) {
-    const t = i / ringCount;
-    const radius = opts.r * (0.4 + t * 0.8);
-    const w = 2 + opts.intensity * 6 * (1 - t);
-    const a = lifeAlpha * (1 - t) * (opts.ghost ? 0.4 : 0.9);
-    ctx.strokeStyle = `rgba(${pr},${pg},${pb},${a})`;
-    ctx.lineWidth = w;
+  // Core gradient disc
+  const core = ctx.createRadialGradient(opts.x, opts.y, 0, opts.x, opts.y, opts.r);
+  core.addColorStop(0, `rgba(${sr},${sg},${sb},${a * 0.7})`);
+  core.addColorStop(0.45, `rgba(${pr},${pg},${pb},${a * 0.4})`);
+  core.addColorStop(1, `rgba(${pr},${pg},${pb},0)`);
+  ctx.fillStyle = core;
+  ctx.beginPath();
+  ctx.arc(opts.x, opts.y, opts.r, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Continuously emitted sonar rings (3 at different phases)
+  const phase = opts.now * 0.001;
+  for (let i = 0; i < 3; i++) {
+    const t = (phase + i / 3) % 1;
+    const rr = opts.r * (0.6 + t * 1.2);
+    const ringA = a * (1 - t) * 0.8;
+    ctx.strokeStyle = `rgba(${pr},${pg},${pb},${ringA})`;
+    ctx.lineWidth = 2 + (1 - t) * 3;
     ctx.beginPath();
-    ctx.arc(opts.x, opts.y, radius, 0, Math.PI * 2);
+    ctx.arc(opts.x, opts.y, rr, 0, Math.PI * 2);
     ctx.stroke();
   }
 
-  const coreGrad = ctx.createRadialGradient(opts.x, opts.y, 0, opts.x, opts.y, opts.r * 0.6);
-  coreGrad.addColorStop(0, `rgba(${sr},${sg},${sb},${lifeAlpha * 0.5})`);
-  coreGrad.addColorStop(0.6, `rgba(${pr},${pg},${pb},${lifeAlpha * 0.25})`);
-  coreGrad.addColorStop(1, `rgba(${pr},${pg},${pb},0)`);
-  ctx.fillStyle = coreGrad;
-  ctx.beginPath();
-  ctx.arc(opts.x, opts.y, opts.r * 0.6, 0, Math.PI * 2);
-  ctx.fill();
-
+  // Per-user flourish (lightning / sparkles)
   if (pal.vibe === "epic") {
-    const arcs = 2 + Math.floor(opts.intensity * 4);
+    const arcs = 3;
     for (let i = 0; i < arcs; i++) {
-      const ang = (i / arcs) * Math.PI * 2 + opts.progress * 2;
-      const rr = opts.r * (0.7 + Math.random() * 0.3);
-      const a = lifeAlpha * 0.6 * (opts.ghost ? 0.5 : 1);
-      ctx.strokeStyle = `rgba(255,255,255,${a})`;
-      ctx.lineWidth = 1.5;
+      const ang = (i / arcs) * Math.PI * 2 + phase * 4;
+      ctx.strokeStyle = `rgba(255,255,255,${a * 0.45})`;
+      ctx.lineWidth = 1.3;
       ctx.beginPath();
-      let lastX = opts.x + Math.cos(ang) * opts.r * 0.2;
-      let lastY = opts.y + Math.sin(ang) * opts.r * 0.2;
-      ctx.moveTo(lastX, lastY);
-      const segs = 6;
+      ctx.moveTo(opts.x + Math.cos(ang) * opts.r * 0.15, opts.y + Math.sin(ang) * opts.r * 0.15);
+      const segs = 5;
       for (let s = 1; s <= segs; s++) {
-        const tr = (s / segs) * rr;
-        const jitter = ((Math.random() - 0.5) * opts.r) / 6;
-        const px = opts.x + Math.cos(ang) * tr + jitter;
-        const py = opts.y + Math.sin(ang) * tr + jitter;
-        ctx.lineTo(px, py);
+        const tr = (s / segs) * opts.r * 0.95;
+        const j = ((Math.random() - 0.5) * opts.r) / 8;
+        ctx.lineTo(opts.x + Math.cos(ang) * tr + j, opts.y + Math.sin(ang) * tr + j);
       }
       ctx.stroke();
     }
   } else {
-    const sparks = 4 + Math.floor(opts.intensity * 8);
+    const sparks = 5;
     for (let i = 0; i < sparks; i++) {
-      const ang = (i / sparks) * Math.PI * 2 + opts.progress * 1.2;
-      const rad = opts.r * (0.6 + Math.sin(opts.progress * 6 + i) * 0.3);
+      const ang = (i / sparks) * Math.PI * 2 + phase * 2;
+      const rad = opts.r * (0.75 + Math.sin(phase * 5 + i) * 0.15);
       const px = opts.x + Math.cos(ang) * rad;
       const py = opts.y + Math.sin(ang) * rad;
-      const a = lifeAlpha * 0.9 * (opts.ghost ? 0.5 : 1);
-      drawStar(ctx, px, py, 3 + opts.intensity * 4, `rgba(255,240,245,${a})`);
+      drawStar(ctx, px, py, 3 + opts.r * 0.04, `rgba(255,240,245,${a * 0.9})`);
     }
   }
+}
 
-  if (opts.label && opts.progress > 0.12 && opts.progress < 0.85) {
-    const textAlpha = Math.sin(opts.progress * Math.PI) * lifeAlpha * 0.95;
-    ctx.save();
-    ctx.globalCompositeOperation = "source-over";
-    const fs = Math.max(12, Math.min(28, opts.r * 0.28));
-    ctx.font = `800 ${fs}px -apple-system, sans-serif`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.shadowColor = `rgba(${pr},${pg},${pb},0.9)`;
-    ctx.shadowBlur = 18;
-    ctx.fillStyle = `rgba(255,255,255,${textAlpha})`;
-    ctx.fillText(opts.label, opts.x, opts.y);
-    ctx.restore();
-  }
-
-  if (opts.breakTarget) {
-    const a = 0.3 + Math.sin(performance.now() * 0.01) * 0.2;
-    ctx.strokeStyle = `rgba(255,80,80,${a})`;
-    ctx.lineWidth = 3;
-    ctx.setLineDash([6, 6]);
+function drawTrail(
+  ctx: CanvasRenderingContext2D,
+  hold: Hold,
+  W: number,
+  H: number,
+  now: number
+) {
+  if (hold.trail.length < 2) return;
+  const pal = PALETTE[hold.user];
+  const [pr, pg, pb] = pal.primary;
+  for (let i = 0; i < hold.trail.length - 1; i++) {
+    const p = hold.trail[i];
+    const age = (now - p.t) / 500;
+    if (age >= 1) continue;
+    const alpha = (1 - age) * 0.4;
+    const radius = (0.04 + (1 - age) * 0.02) * Math.min(W, H);
+    ctx.fillStyle = `rgba(${pr},${pg},${pb},${alpha})`;
     ctx.beginPath();
-    ctx.arc(opts.x, opts.y, opts.r * 0.9, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    ctx.arc(p.x * W, p.y * H, radius, 0, Math.PI * 2);
+    ctx.fill();
   }
+}
+
+function drawSplash(
+  ctx: CanvasRenderingContext2D,
+  opts: { x: number; y: number; r: number; user: User; alpha: number }
+) {
+  const pal = PALETTE[opts.user];
+  const [pr, pg, pb] = pal.primary;
+  ctx.strokeStyle = `rgba(${pr},${pg},${pb},${opts.alpha})`;
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.arc(opts.x, opts.y, opts.r, 0, Math.PI * 2);
+  ctx.stroke();
+
+  const core = ctx.createRadialGradient(opts.x, opts.y, 0, opts.x, opts.y, opts.r * 0.8);
+  core.addColorStop(0, `rgba(${pr},${pg},${pb},${opts.alpha * 0.4})`);
+  core.addColorStop(1, `rgba(${pr},${pg},${pb},0)`);
+  ctx.fillStyle = core;
+  ctx.beginPath();
+  ctx.arc(opts.x, opts.y, opts.r * 0.8, 0, Math.PI * 2);
+  ctx.fill();
 }
 
 function drawStar(ctx: CanvasRenderingContext2D, x: number, y: number, size: number, color: string) {
@@ -1171,7 +1048,14 @@ function drawStar(ctx: CanvasRenderingContext2D, x: number, y: number, size: num
   ctx.restore();
 }
 
-function drawHeart(ctx: CanvasRenderingContext2D, x: number, y: number, size: number, color: string, rot: number) {
+function drawHeart(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  size: number,
+  color: string,
+  rot: number
+) {
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(rot);
