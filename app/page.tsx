@@ -99,7 +99,8 @@ const PALETTE = {
 const HOLD_THRESHOLD_MS = 180;
 const MOVE_MIN_INTERVAL_MS = 80;
 const MOVE_MIN_DELTA = 0.005;
-const HOLD_STALE_MS = 3000;
+const HOLD_STALE_MS = 8000;
+const HOLD_KEEPALIVE_MS = 2000;
 const DECAY_MS = 600;
 const TAP_LIFE_MS = 650;
 const CRASH_INITIAL_COOLDOWN = 400;
@@ -561,8 +562,21 @@ export default function Home() {
       setConnected(true);
       if (ownSubRef.current) broadcastOwnSub();
     });
-    pusher.connection.bind("state_change", (s: { current: string }) => {
+    pusher.connection.bind("state_change", (s: { previous: string; current: string }) => {
       setConnected(s.current === "connected");
+      if (s.previous !== "connected" && s.current === "connected") {
+        // Reconnected — re-sync any active local hold so the other side restores it.
+        if (ownSubRef.current) broadcastOwnSub();
+        const me = userRef.current;
+        const hold = myHoldRef.current;
+        if (me && hold) {
+          fetch("/api/hold", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "start", id: hold.id, user: me, x: hold.x, y: hold.y }),
+          }).catch(() => {});
+        }
+      }
     });
 
     channel.bind("tap", (data: { id: string; user: User; x: number; y: number }) => {
@@ -603,11 +617,16 @@ export default function Home() {
           const cur = theirHoldRef.current;
           if (!cur || cur.id !== data.id) return;
           const now = performance.now();
-          cur.x = data.x ?? cur.x;
-          cur.y = data.y ?? cur.y;
+          const newX = data.x ?? cur.x;
+          const newY = data.y ?? cur.y;
+          const moved = Math.hypot(newX - cur.x, newY - cur.y) > 0.002;
+          cur.x = newX;
+          cur.y = newY;
           cur.lastMoveAt = now;
-          cur.trail.push({ x: cur.x, y: cur.y, t: now });
-          if (cur.trail.length > 8) cur.trail.shift();
+          if (moved) {
+            cur.trail.push({ x: newX, y: newY, t: now });
+            if (cur.trail.length > 8) cur.trail.shift();
+          }
         } else if (data.action === "end") {
           const cur = theirHoldRef.current;
           if (!cur || cur.id !== data.id) return;
@@ -964,6 +983,21 @@ export default function Home() {
     canvas.addEventListener("pointercancel", onCancel);
     canvas.addEventListener("pointerleave", onCancel);
 
+    // Keepalive: while holding, re-send position every ~2s even if finger is still,
+    // so the remote side doesn't age us out during bonds or still holds.
+    const keepaliveId = setInterval(() => {
+      const s = pointerSessionRef.current;
+      const hold = myHoldRef.current;
+      const me = userRef.current;
+      if (!s || !hold || !me || !s.holdId) return;
+      const now = performance.now();
+      if (now - s.lastSendAt < HOLD_KEEPALIVE_MS) return;
+      s.lastSendAt = now;
+      s.lastSentX = hold.x;
+      s.lastSentY = hold.y;
+      postHold({ action: "move", id: hold.id, user: me, x: hold.x, y: hold.y });
+    }, 1000);
+
     const heldRadius = (hold: Hold, now: number) => {
       const age = Math.max(0, now - hold.startedAt);
       const growth = 1 - Math.pow(2, -age / 600);
@@ -1219,6 +1253,7 @@ export default function Home() {
 
     return () => {
       cancelAnimationFrame(rafId);
+      clearInterval(keepaliveId);
       window.removeEventListener("resize", resize);
       canvas.removeEventListener("pointerdown", onDown);
       canvas.removeEventListener("pointermove", onMove);
